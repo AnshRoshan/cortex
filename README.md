@@ -1,129 +1,92 @@
-# Rustpad
+# Cortex
 
-[![Docker Pulls](https://img.shields.io/docker/pulls/ekzhang/rustpad)](https://hub.docker.com/r/ekzhang/rustpad/)
-[![Docker Image Size](https://img.shields.io/docker/image-size/ekzhang/rustpad/latest)](https://hub.docker.com/r/ekzhang/rustpad/)
-[![GitHub Workflow Status](https://img.shields.io/github/actions/workflow/status/ekzhang/rustpad/ci.yml)](https://github.com/ekzhang/rustpad/actions/workflows/ci.yml)
+**Cortex** is a private, authenticated, multi-file collaborative workspace. It
+presents as an AI workspace on the surface; behind a locked login it is a
+real-time collaborative code editor (Monaco + operational transformation).
 
-**Rustpad** is an _efficient_ and _minimal_ open-source collaborative text
-editor based on the operational transformation algorithm. It lets users
-collaborate in real time while writing code in their browser. Rustpad is
-completely self-hosted and fits in a tiny Docker image, no database required.
+Built on top of [Rustpad](https://github.com/ekzhang/rustpad)'s OT engine, with
+a closed authentication layer, workspaces, multi-file editing, and admin-only
+file upload/download added on top.
 
-<p align="center">
-<a href="https://rustpad.io/">
-<img src="https://i.imgur.com/WjU5UrP.png" width="800"><br>
-<strong>rustpad.io</strong>
-</a>
-</p>
+## Key properties
 
-The server is written in Rust using the
-[warp](https://github.com/seanmonstar/warp) web server framework and the
-[operational-transform](https://github.com/spebern/operational-transform-rs)
-library. We use [wasm-bindgen](https://github.com/rustwasm/wasm-bindgen) to
-compile text operation logic to WebAssembly code, which runs in the browser. The
-frontend is written in TypeScript using [React](https://reactjs.org/) and
-interfaces with [Monaco](https://github.com/microsoft/monaco-editor), the text
-editor that powers VS Code.
+- **Closed by default.** No signup. Users exist only by backend seeding. Every
+  data route (documents, the collaborative socket, stats) requires a valid
+  session; nothing is reachable anonymously.
+- **Roles.** `admin` owns a workspace, adds members, and is the only role that
+  can upload/download files. Regular `user`s can open and edit files
+  collaboratively.
+- **Multi-file, multi-user.** Each file is its own OT document; many users edit
+  the same file in real time with live cursors.
+- **SQLite** for users, sessions, workspaces, files, and document content.
 
-Architecturally, client-side code communicates via WebSocket with a central
-server that stores in-memory data structures. This makes the editor very fast,
-allows us to avoid provisioning a database, and makes testing much easier. The
-tradeoff is that documents are transient and lost between server restarts, or
-after 24 hours of inactivity.
+## Prerequisites
 
-## Development setup
+- Rust toolchain (`rustup`) **with a C compiler/linker** — on Windows install
+  the "Desktop development with C++" workload (provides `link.exe`); SQLite and
+  crypto crates compile C.
+- `wasm-pack` (`npm i -g wasm-pack`) and the `wasm32-unknown-unknown` target
+  (`rustup target add wasm32-unknown-unknown`).
+- Node.js + npm.
 
-To run this application, you need to install Rust, `wasm-pack`, and Node.js.
-Then, build the WebAssembly portion of the app:
+## Configure
 
-```
-wasm-pack build rustpad-wasm
-```
+Copy `seed_users.example.json` to `seed_users.json` and set real credentials.
+This is the **only** way accounts are created:
 
-When that is complete, you can install dependencies for the frontend React
-application:
-
-```
-npm install
+```json
+[
+  { "email": "you@example.com", "password": "a-strong-password", "role": "admin" }
+]
 ```
 
-Next, compile and run the backend web server:
+`.env` controls `SQLITE_URI` (defaults to `sqlite://authpad.db`), `SEED_FILE`,
+and `PORT`.
 
-```
-cargo run
-```
+## Run with Docker (recommended — no host toolchain needed)
 
-While the backend is running, open another shell and run the following command
-to start the frontend portion.
+### Fast dev loop (use this while building)
 
-```
-npm run dev
-```
-
-This command will open a browser window to `http://localhost:5173`, with hot
-reloading on changes.
-
-## Testing
-
-To run integration tests for the server, use the standard `cargo test` command.
-For the WebAssembly component, you can run tests in a headless browser with
-
-```
-wasm-pack test --chrome --headless rustpad-wasm
+```bash
+docker compose -f docker-compose.dev.yml up
+# → open http://localhost:5173
 ```
 
-## Configuration
+- **Frontend hot-reloads** — edit a `.tsx`, the browser updates instantly, no rebuild.
+- **Backend auto-recompiles** on Rust changes (cargo-watch, debug build).
+- Cargo registry, build cache, `node_modules`, and the wasm package are cached in
+  volumes, so only the **first** `up` is slow; every run after is fast.
 
-Although the default behavior of Rustpad is to store documents solely in memory
-and collect garbage after 24 hours of inactivity, this can be configured by
-setting the appropriate variables. The application server looks for the
-following environment variables on startup:
+### Production image (single self-contained container)
 
-- `EXPIRY_DAYS`: An integer corresponding to the number of days that inactive
-  documents are kept in memory before being garbage collected by the server
-  (default 1 day).
-- `SQLITE_URI`: A SQLite connection string used for persistence. If provided,
-  Rustpad will snapshot document contents to a local file, which enables them to
-  be retained between server restarts and after their in-memory data structures
-  expire. (When deploying a Docker container, this should point to the path of a
-  mounted volume.)
-- `PORT`: Which local port to listen for HTTP connections on (defaults to 3030).
-- `RUST_LOG`: Directives that control application logging, see the
-  [env_logger](https://docs.rs/env_logger/#enabling-logging) docs for more
-  information.
-
-## Deployment
-
-Rustpad is distributed as a single 6 MB Docker image, which is built
-automatically from the `Dockerfile` in this repository. You can pull the latest
-version of this image from Docker Hub. It has multi-platform support for
-`linux/amd64` and `linux/arm64`.
-
-```
-docker pull ekzhang/rustpad
+```bash
+docker compose up --build
+# → open http://localhost:3030
 ```
 
-(You can also manually build this image with `docker build -t rustpad .` in the
-project root directory.) To run locally, execute the following command, then
-open `http://localhost:3030` in your browser.
+Stop one before starting the other — both use port 3030.
 
+Sign in with a seeded account (see `seed_users.json`). An admin creates the
+workspace, adds members, and manages files; members join and edit.
+
+## Build without Docker
+
+```bash
+(cd rustpad-wasm && wasm-pack build)   # WebAssembly OT core
+npm install && npm run build           # frontend
+cargo run --release --manifest-path rustpad-server/Cargo.toml
 ```
-docker run --rm -dp 3030:3030 ekzhang/rustpad
+
+Requires a Rust toolchain with a C compiler/linker (on Windows: the VS "Desktop
+development with C++" workload), `wasm-pack`, and the `wasm32-unknown-unknown`
+target.
+
+## Tests
+
+```bash
+cargo test --manifest-path rustpad-server/Cargo.toml auth   # auth unit tests
 ```
 
-We deploy a public instance of this image using [Fly.io](https://fly.io/).
-
-## In the media
-
-- **July 11, 2021:** Featured in
-  [Console 61 - The open-source newsletter](https://console.substack.com/p/console-61).
-- **June 5, 2021:** Front-page
-  [Hacker News post](https://news.ycombinator.com/item?id=27408326). Reddit
-  discussions in [r/rust](https://www.reddit.com/r/rust/comments/nt4p9f/) and
-  [r/programming](https://www.reddit.com/r/programming/comments/nt4ws7/).
-
-<br>
-
-<sup>
-All code is licensed under the <a href="LICENSE">MIT license</a>.
-</sup>
+> Note: the original Rustpad integration tests under `rustpad-server/tests/`
+> predate authentication and assume open access; they need updating for the
+> locked model.

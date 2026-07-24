@@ -15,9 +15,12 @@ use warp::{filters::BoxedFilter, ws::Ws, Filter, Rejection, Reply};
 
 use crate::{database::Database, rustpad::Rustpad};
 
+pub mod account;
+pub mod auth;
 pub mod database;
 mod ot;
 mod rustpad;
+pub mod workspace;
 
 /// An entry stored in the global server map.
 ///
@@ -96,13 +99,24 @@ pub fn server(config: ServerConfig) -> BoxedFilter<(impl Reply,)> {
         .boxed()
 }
 
-/// Construct routes for static files from React.
+/// Construct routes for static files from React, with an SPA fallback so deep
+/// links (e.g. `/backend`) load index.html instead of 404ing.
 fn frontend() -> BoxedFilter<(impl Reply,)> {
-    warp::fs::dir("dist").boxed()
+    warp::fs::dir("dist")
+        .or(warp::get().and(warp::fs::file("dist/index.html")))
+        .boxed()
 }
 
 /// Construct backend routes, including WebSocket handlers.
+///
+/// AuthPad requires a database (for users and sessions). Every data route below
+/// is gated behind a valid session via [`auth::with_auth`].
 fn backend(config: ServerConfig) -> BoxedFilter<(impl Reply,)> {
+    let db = config
+        .database
+        .clone()
+        .expect("AuthPad requires a database; set SQLITE_URI");
+
     let state = ServerState {
         documents: Default::default(),
         database: config.database,
@@ -111,25 +125,74 @@ fn backend(config: ServerConfig) -> BoxedFilter<(impl Reply,)> {
 
     let state_filter = warp::any().map(move || state.clone());
 
+    // Public auth endpoints (login / logout / me).
+    let auth_routes = auth::routes(db.clone());
+    // Workspace / file management endpoints (session-gated inside).
+    let workspace_routes = workspace::routes(db.clone());
+    // Profile + hidden root admin console.
+    let account_routes = account::routes(db.clone());
+
+    // A plain db filter used by the document access checks below.
+    let db_for_docs = db.clone();
+    let db_filter = warp::any().map(move || db_for_docs.clone());
+
     let socket = warp::path!("socket" / String)
+        .and(auth::with_auth(db.clone()))
         .and(warp::ws())
+        .and(db_filter.clone())
         .and(state_filter.clone())
-        .and_then(socket_handler);
+        .and_then(
+            |id: String, user: database::User, ws: Ws, db: Database, state: ServerState| async move {
+                // The document must belong to a workspace in the user's org
+                // (root may access any) — otherwise no access.
+                if !doc_allowed(&db, &user, &id).await {
+                    return Err(warp::reject::custom(auth::Forbidden));
+                }
+                socket_handler(id, ws, state).await
+            },
+        );
 
     let text = warp::path!("text" / String)
+        .and(auth::with_auth(db.clone()))
+        .and(db_filter)
         .and(state_filter.clone())
-        .and_then(text_handler);
+        .and_then(
+            |id: String, user: database::User, db: Database, state: ServerState| async move {
+                if !doc_allowed(&db, &user, &id).await {
+                    return Err(warp::reject::custom(auth::Forbidden));
+                }
+                text_handler(id, state).await
+            },
+        );
 
     let start_time = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .expect("SystemTime returned before UNIX_EPOCH")
         .as_secs();
     let stats = warp::path!("stats")
+        .and(auth::with_auth(db))
         .and(warp::any().map(move || start_time))
         .and(state_filter)
-        .and_then(stats_handler);
+        .and_then(|_user: database::User, start_time: u64, state: ServerState| {
+            stats_handler(start_time, state)
+        });
 
-    socket.or(text).or(stats).boxed()
+    auth_routes
+        .or(account_routes)
+        .or(workspace_routes)
+        .or(socket)
+        .or(text)
+        .or(stats)
+        .recover(auth::handle_rejection)
+        .boxed()
+}
+
+/// Whether a user may access the document `doc_id` (same org, or root owner).
+async fn doc_allowed(db: &Database, user: &database::User, doc_id: &str) -> bool {
+    match db.doc_org(doc_id).await.ok().flatten() {
+        Some(org) => user.role == "root" || Some(org) == user.org_id,
+        None => false,
+    }
 }
 
 /// Handler for the `/api/socket/{id}` endpoint.

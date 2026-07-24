@@ -6,7 +6,9 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.40"
+bcrypt = "0.15"
 bytecount = "0.6"
+bytes = "1"
 dashmap = "4.0.2"
 dotenv = "0.15.0"
 futures = "0.3.15"

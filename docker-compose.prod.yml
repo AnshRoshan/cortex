@@ -1,0 +1,36 @@
+# Production: Cortex behind Caddy (automatic HTTPS).
+# Usage on the server:
+#   DOMAIN=<your-ip>.sslip.io docker compose -f docker-compose.prod.yml up -d --build
+services:
+  app:
+    build: .
+    restart: unless-stopped
+    environment:
+      - SQLITE_URI=sqlite:///data/authpad.db
+      - SEED_FILE=/data/seed_users.json
+      - COOKIE_SECURE=1
+      - RUST_LOG=info
+    volumes:
+      - cortex-data:/data
+      - ./seed_users.json:/data/seed_users.json:ro
+    # No published ports: only Caddy can reach it, over the compose network.
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      - DOMAIN=${DOMAIN:?set DOMAIN, e.g. 3.7.45.21.sslip.io}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - app
+
+volumes:
+  cortex-data:
+  caddy-data:
+  caddy-config:

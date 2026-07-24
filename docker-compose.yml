@@ -1,0 +1,22 @@
+# Dev runner for Cortex — no Rust/Node/C++ toolchain needed on the host.
+#   docker compose up --build
+# Then open http://localhost:3030 and log in with a seeded account.
+services:
+  cortex:
+    build:
+      context: .
+    ports:
+      # Bind to localhost only — never exposed to the LAN or public internet.
+      - "127.0.0.1:3030:3030"
+    environment:
+      RUST_LOG: info
+      EXPIRY_DAYS: "1"
+      # SQLITE_URI and SEED_FILE are set in the image; overridable here.
+    volumes:
+      # Persist the SQLite database (users, sessions, workspaces, files).
+      - cortex-data:/data
+      # Seed file is mounted at runtime so credentials never enter an image layer.
+      - ./seed_users.json:/app/seed_users.json:ro
+
+volumes:
+  cortex-data:
