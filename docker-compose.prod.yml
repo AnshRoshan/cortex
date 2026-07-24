@@ -7,12 +7,14 @@ services:
     restart: unless-stopped
     environment:
       - SQLITE_URI=sqlite:///data/authpad.db
-      - SEED_FILE=/data/seed_users.json
+      - SEED_FILE=/seed/seed_users.json
       - COOKIE_SECURE=1
       - RUST_LOG=info
     volumes:
       - cortex-data:/data
-      - ./seed_users.json:/data/seed_users.json:ro
+      # Mounted in its own dir (not under /data) so it doesn't collide with the
+      # data volume. Must be world-readable on the host (see DEPLOY.md).
+      - ./seed_users.json:/seed/seed_users.json:ro
     # No published ports: only Caddy can reach it, over the compose network.
 
   caddy:

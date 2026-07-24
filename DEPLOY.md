@@ -25,8 +25,11 @@ From your machine (PowerShell), excluding local build junk:
 scp -i key.pem -r . ubuntu@<ELASTIC_IP>:cortex   # or git clone on the server
 ```
 
-Then on the server: `chmod 600 cortex/seed_users.json` — it holds plaintext
-seed passwords. Change them via the app after first login.
+Then on the server: `chmod 644 cortex/seed_users.json`. It holds plaintext seed
+passwords, but the container's app user (uid 1000) must be able to read it, and
+it isn't owned by that user — so it needs to be world-readable. The box is
+single-tenant and the file is never web-exposed or committed to git. Change the
+passwords via the app after first login, then the file no longer matters.
 
 ## 4. Run
 
