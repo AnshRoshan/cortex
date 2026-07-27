@@ -1,7 +1,8 @@
 # Deploying Cortex to EC2
 
 One container + SQLite; Caddy in front provides free auto-renewing HTTPS.
-No domain needed — sslip.io maps `<ip>.sslip.io` to your IP automatically.
+Works with a real domain (e.g. `nexus.isroot.in`) or, with no domain, sslip.io
+which maps `<ip>.sslip.io` to your IP automatically. The URL is set via `DOMAIN=`.
 
 ## 1. EC2 setup (once)
 
@@ -25,6 +26,14 @@ From your machine (PowerShell), excluding local build junk:
 scp -i key.pem -r . ubuntu@<ELASTIC_IP>:cortex   # or git clone on the server
 ```
 
+If you **cloned via git** (rather than scp), create the seed file first — it's
+gitignored, so it isn't in the repo:
+
+```sh
+cp seed_users.example.json seed_users.json
+nano seed_users.json   # set the owner (role "root") + users/passwords
+```
+
 Then on the server: `chmod 644 cortex/seed_users.json`. It holds plaintext seed
 passwords, but the container's app user (uid 1000) must be able to read it, and
 it isn't owned by that user — so it needs to be world-readable. The box is
@@ -40,6 +49,18 @@ DOMAIN=<ELASTIC_IP>.sslip.io docker compose -f docker-compose.prod.yml up -d --b
 
 First build takes a few minutes. Then open `https://<ELASTIC_IP>.sslip.io`.
 Caddy fetches the certificate on the first request (needs ports 80+443 open).
+
+### Custom domain (e.g. nexus.isroot.in)
+
+Same command — just point the domain's **A record at the Elastic IP** first,
+then set `DOMAIN` to the domain instead of the sslip.io name:
+
+```sh
+DOMAIN=nexus.isroot.in docker compose -f docker-compose.prod.yml up -d --build
+```
+
+Caddy issues the cert on the first request, so DNS must already resolve to the
+box and ports 80+443 must be open. DNS propagation can take a while (up to a day).
 
 ## 5. Backups (the whole DB is one file)
 
