@@ -1,0 +1,4 @@
+nexus.isroot.in {
+	# Terminate TLS (auto Let's Encrypt) and forward to the app container.
+	reverse_proxy cortex:3030
+}

@@ -1,0 +1,33 @@
+# OPT-IN public deployment — serves https://nexus.isroot.in via Caddy.
+# The default docker-compose.yml stays localhost-only; this only takes effect
+# when you explicitly layer it on:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.public.yml up -d --build
+#
+# PREREQUISITES (must be true, and are NOT doable from this repo):
+#   1. DNS:  nexus.isroot.in  A  ->  this server's PUBLIC IP  (set in isroot.in).
+#   2. Firewall/router: allow inbound TCP 80 and 443 to this host.
+#   3. Let's Encrypt must be able to reach this host on :80 for the ACME check.
+#   4. This is a machine you are ALLOWED to expose — NOT a corporate workstation.
+services:
+  cortex:
+    environment:
+      # HTTPS is now terminated by Caddy, so session cookies must be Secure.
+      COOKIE_SECURE: "1"
+
+  caddy:
+    image: caddy:2-alpine
+    depends_on:
+      - cortex
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    restart: unless-stopped
+
+volumes:
+  caddy-data:
+  caddy-config:

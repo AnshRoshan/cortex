@@ -58,9 +58,26 @@ DOMAIN=<ELASTIC_IP>.sslip.io docker compose -f docker-compose.prod.yml up -d --b
 
 Data survives rebuilds — it lives in the `cortex-data` volume.
 
+## Two-factor (authenticator app)
+
+Any account can turn on TOTP 2FA from **Account & security** (owner console header
+gear, or the account menu in the workspace). The owner can reset a user's 2FA from
+the Accounts tab (shield icon) if they lose their phone.
+
+**Owner lost their authenticator (break-glass).** The owner is the only account
+nobody else can reset, so recovery is host-level — only you control the EC2 box:
+
+```sh
+# one-shot: clears 2FA on the owner account, then start normally again
+OWNER_2FA_RESET=1 DOMAIN=<ELASTIC_IP>.sslip.io docker compose -f docker-compose.prod.yml up -d
+# sign in with just the password, re-enroll, then bring it back up WITHOUT the flag
+DOMAIN=<ELASTIC_IP>.sslip.io docker compose -f docker-compose.prod.yml up -d
+```
+
 ## Notes
 
 - `COOKIE_SECURE=1` is set in the prod compose (session cookie is HTTPS-only).
+- The owner's session is short-lived (12h) vs 7 days for everyone else.
 - The app publishes no ports in prod; only Caddy reaches it on the compose network.
 - If you later buy a real domain, point an A record at the Elastic IP and just
   change `DOMAIN=`.
