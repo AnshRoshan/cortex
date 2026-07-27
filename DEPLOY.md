@@ -74,10 +74,60 @@ crontab -e
 
 ```sh
 git pull   # or re-scp
-DOMAIN=<ELASTIC_IP>.sslip.io docker compose -f docker-compose.prod.yml up -d --build
+DOMAIN=<ELASTIC_IP>.sslip.io docker compose -f docker-compose.prod.yml up -d --build --remove-orphans
+docker image prune -f   # reclaim disk from the old image each `--build` leaves behind
 ```
 
+`--remove-orphans` clears containers from services that no longer exist (e.g. a
+leftover dev container). `docker image prune -f` deletes the now-dangling old
+images — without it, every `--build` grows disk until the small box fills up.
 Data survives rebuilds — it lives in the `cortex-data` volume.
+
+## Keeping a small (t3.micro) box healthy
+
+The Rust build needs more RAM than a `t3.micro` (1 GB) has, so it swaps and
+crawls. Two things make deploys fast and stop the disk filling:
+
+**1. Add swap once** (turns a thrashing 20-min build into a few minutes):
+```sh
+sudo fallocate -l 4G /swapfile && sudo chmod 600 /swapfile
+sudo mkswap /swapfile && sudo swapon /swapfile
+echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab   # persist across reboots
+free -h   # confirm Swap shows 4Gi
+```
+
+**2. Build off-box (best), then just pull the image.** Build the image on your
+laptop or CI where RAM is plentiful, then on EC2 only `docker pull` + `up` —
+the tiny box never compiles. Either push to a private registry, or copy the
+image directly with no registry:
+```sh
+# on a beefy machine:
+docker build -t cortex:latest .
+docker save cortex:latest | gzip | ssh ubuntu@<IP> 'gunzip | sudo docker load'
+# then on EC2, point the compose `app` service at image: cortex:latest and `up -d` (no --build)
+```
+
+## `git pull` as root: SSH deploy key
+
+The repo is root-owned under `/opt/cortex`, so `git pull` runs as **root** — but
+the SSH deploy key usually lives in a non-root user's home, so root gets
+`git@github.com: Permission denied (publickey)`. Point git at the key explicitly
+(one-time, persists in the repo config):
+```sh
+sudo -i
+# find the deploy key (commonly under the user you first cloned as):
+ls -la /home/*/.ssh/
+cd /opt/cortex
+git config core.sshCommand "ssh -i /home/<user>/.ssh/<deploy_key> -o IdentitiesOnly=yes"
+git pull
+```
+Alternatively copy the key to root and use it everywhere:
+```sh
+sudo mkdir -p /root/.ssh && sudo cp /home/<user>/.ssh/<deploy_key> /root/.ssh/deploy_key
+sudo chmod 600 /root/.ssh/deploy_key
+printf 'Host github.com\n  IdentityFile /root/.ssh/deploy_key\n  IdentitiesOnly yes\n' | sudo tee -a /root/.ssh/config
+```
+(Or switch the remote to HTTPS + a Personal Access Token: `git remote set-url origin https://github.com/anshace/cortex.git`.)
 
 ## Two-factor (authenticator app)
 

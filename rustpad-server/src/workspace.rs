@@ -922,16 +922,41 @@ async fn ai_chat(user: User, db: Database, body: AiChatReq) -> Result<impl Reply
         Err(_) => return Ok(err(StatusCode::INTERNAL_SERVER_ERROR, "AI client init failed")),
     };
 
-    // Build the request for the chosen wire format.
-    let req = if prov.provider == "openai" {
-        // OpenAI-compatible: system is the first message; Bearer auth.
-        let base = prov.base_url.as_deref().map(trim_url).unwrap_or("https://api.openai.com/v1");
+    // "openai" and "azure" share the Chat Completions wire format; only the URL
+    // and auth header differ.
+    let openai_style = prov.provider == "openai" || prov.provider == "azure";
+
+    let req = if openai_style {
         let mut oai_msgs = vec![json!({ "role": "system", "content": system })];
         oai_msgs.extend(msgs.iter().cloned());
-        client
-            .post(format!("{}/chat/completions", base))
-            .header("authorization", format!("Bearer {}", prov.api_key))
-            .json(&json!({ "model": prov.model, "max_tokens": 8192, "messages": oai_msgs }))
+        // Newer OpenAI reasoning models (o-series, gpt-5) reject `max_tokens` and
+        // require `max_completion_tokens`; everything else uses `max_tokens`.
+        let m = prov.model.to_lowercase();
+        let token_key = if m.starts_with("o1") || m.starts_with("o3") || m.starts_with("o4") || m.starts_with("gpt-5") {
+            "max_completion_tokens"
+        } else {
+            "max_tokens"
+        };
+        let mut body = json!({ "model": prov.model, "messages": oai_msgs });
+        body[token_key] = json!(8192);
+
+        if prov.provider == "azure" {
+            // Azure: full deployment base in base_url, `api-key` header, api-version query.
+            let base = match prov.base_url.as_deref() {
+                Some(b) if !b.trim().is_empty() => trim_url(b),
+                _ => return Ok(err(StatusCode::BAD_REQUEST, "Azure needs the deployment base URL")),
+            };
+            client
+                .post(format!("{}/chat/completions?api-version=2024-10-21", base))
+                .header("api-key", prov.api_key.clone())
+                .json(&body)
+        } else {
+            let base = prov.base_url.as_deref().map(trim_url).unwrap_or("https://api.openai.com/v1");
+            client
+                .post(format!("{}/chat/completions", base))
+                .header("authorization", format!("Bearer {}", prov.api_key))
+                .json(&body)
+        }
     } else {
         let base = prov.base_url.as_deref().map(trim_url).unwrap_or("https://api.anthropic.com");
         client
@@ -956,7 +981,7 @@ async fn ai_chat(user: User, db: Database, body: AiChatReq) -> Result<impl Reply
         Err(_) => return Ok(err(StatusCode::BAD_GATEWAY, "bad AI response")),
     };
 
-    let reply = if prov.provider == "openai" {
+    let reply = if openai_style {
         val.pointer("/choices/0/message/content").and_then(|v| v.as_str()).unwrap_or_default().to_string()
     } else {
         val.get("content")
@@ -1033,7 +1058,7 @@ async fn set_ai_provider(user: User, db: Database, body: ProviderBody) -> Result
     if !crypto::secret_storage_ready() {
         return Ok(err(StatusCode::SERVICE_UNAVAILABLE, "Key storage isn't configured (set AI_KEY_SECRET)."));
     }
-    if body.provider != "anthropic" && body.provider != "openai" {
+    if !matches!(body.provider.as_str(), "anthropic" | "openai" | "azure") {
         return Ok(err(StatusCode::BAD_REQUEST, "unknown provider"));
     }
     if body.model.trim().is_empty() {

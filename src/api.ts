@@ -227,7 +227,8 @@ export async function aiChat(workspaceId: number, messages: AiMessage[]): Promis
 }
 
 // ----- AI provider settings (keys are write-only; never returned) -----
-export type AiProviderView = { provider: "anthropic" | "openai"; base_url: string | null; model: string; has_key: boolean };
+export type AiProviderKind = "anthropic" | "openai" | "azure";
+export type AiProviderView = { provider: AiProviderKind; base_url: string | null; model: string; has_key: boolean };
 export type AiSettings = {
   storage_ready: boolean; // AI_KEY_SECRET is set (keys can be stored)
   env_fallback: boolean; // server ANTHROPIC_API_KEY is set
@@ -242,7 +243,7 @@ export async function getAiSettings(): Promise<AiSettings> {
 }
 export async function saveAiProvider(body: {
   scope: "user" | "org";
-  provider: "anthropic" | "openai";
+  provider: AiProviderKind;
   base_url?: string;
   model: string;
   key?: string;

@@ -706,7 +706,13 @@ function ActivityPanel() {
 // ----- AI provider config -----
 const MODEL_HINTS: Record<string, string> = {
   anthropic: "e.g. claude-opus-5, claude-sonnet-5, claude-haiku-4-5",
-  openai: "e.g. gpt-4o, gpt-4o-mini, or your model name",
+  openai: "e.g. gpt-4o, gpt-4o-mini, o3-mini, or your model name",
+  azure: "your deployment name",
+};
+const BASEURL_HINTS: Record<string, string> = {
+  anthropic: "https://api.anthropic.com",
+  openai: "https://api.openai.com/v1",
+  azure: "https://<resource>.openai.azure.com/openai/deployments/<deployment>",
 };
 
 function ProviderForm({
@@ -721,7 +727,7 @@ function ProviderForm({
   onChanged: () => void;
 }) {
   const toast = useToast();
-  const [provider, setProvider] = useState<"anthropic" | "openai">(initial?.provider ?? "anthropic");
+  const [provider, setProvider] = useState<api.AiProviderKind>(initial?.provider ?? "anthropic");
   const [baseUrl, setBaseUrl] = useState(initial?.base_url ?? "");
   const [model, setModel] = useState(initial?.model ?? "");
   const [key, setKey] = useState("");
@@ -769,9 +775,10 @@ function ProviderForm({
           <FormLabel fontSize="xs" color="ink.muted">
             Provider
           </FormLabel>
-          <Select size="sm" value={provider} onChange={(e) => setProvider(e.target.value as "anthropic" | "openai")}>
+          <Select size="sm" value={provider} onChange={(e) => setProvider(e.target.value as api.AiProviderKind)}>
             <option value="anthropic">Anthropic (Claude)</option>
-            <option value="openai">OpenAI-compatible (OpenAI, Azure, OpenRouter, Ollama…)</option>
+            <option value="openai">OpenAI-compatible (OpenAI, OpenRouter, Ollama, Groq…)</option>
+            <option value="azure">Azure OpenAI</option>
           </Select>
         </FormControl>
         <FormControl>
@@ -787,7 +794,7 @@ function ProviderForm({
           <Input
             size="sm"
             value={baseUrl}
-            placeholder={provider === "openai" ? "https://api.openai.com/v1" : "https://api.anthropic.com"}
+            placeholder={(provider === "azure" ? "required · " : "") + BASEURL_HINTS[provider]}
             onChange={(e) => setBaseUrl(e.target.value)}
           />
         </FormControl>
