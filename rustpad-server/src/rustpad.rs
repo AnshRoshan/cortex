@@ -12,7 +12,24 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, Notify};
 use warp::ws::{Message, WebSocket};
 
-use crate::{database::PersistedDocument, ot::transform_index};
+use crate::{crypto, database::PersistedDocument, ot::transform_index};
+
+/// The first WebSocket frame from a client: its ECDH public key. Everything
+/// after is an encrypted `{iv,ct}` envelope over the same JSON protocol.
+#[derive(Deserialize)]
+struct EpkFrame {
+    epk: String,
+}
+
+/// Serialize + encrypt a server message into a wire frame for the holder of `epk`.
+fn enc(epk: &str, msg: ServerMsg) -> Message {
+    let plain = serde_json::to_string(&msg).expect("serialize ServerMsg");
+    match crypto::keys().seal(epk, plain.as_bytes()) {
+        Some(env) => Message::text(serde_json::to_string(&env).expect("serialize envelope")),
+        // Unreachable in practice: the epk is validated when the socket opens.
+        None => Message::text("{}"),
+    }
+}
 
 /// The main object representing a collaborative session.
 pub struct Rustpad {
@@ -178,9 +195,27 @@ impl Rustpad {
     }
 
     async fn handle_connection(&self, id: u64, mut socket: WebSocket) -> Result<()> {
+        // Handshake: the first text frame carries the client's ECDH public key.
+        let epk = loop {
+            match socket.next().await {
+                Some(Ok(msg)) if msg.is_text() => {
+                    match serde_json::from_str::<EpkFrame>(msg.to_str().unwrap_or("")) {
+                        Ok(f) => break f.epk,
+                        Err(_) => return Ok(()), // not a handshake frame
+                    }
+                }
+                Some(Ok(_)) => continue, // ping / binary before handshake
+                _ => return Ok(()),
+            }
+        };
+        // Fail fast if we can't derive a shared key from this public key.
+        if crypto::keys().seal(&epk, b"ping").is_none() {
+            return Ok(());
+        }
+
         let mut update_rx = self.update.subscribe();
 
-        let mut revision: usize = self.send_initial(id, &mut socket).await?;
+        let mut revision: usize = self.send_initial(id, &mut socket, &epk).await?;
 
         loop {
             // In order to avoid the "lost wakeup" problem, we first request a
@@ -191,19 +226,19 @@ impl Rustpad {
                 break;
             }
             if self.revision() > revision {
-                revision = self.send_history(revision, &mut socket).await?
+                revision = self.send_history(revision, &mut socket, &epk).await?
             }
 
             tokio::select! {
                 _ = notified => {}
                 update = update_rx.recv() => {
-                    socket.send(update?.into()).await?;
+                    socket.send(enc(&epk, update?)).await?;
                 }
                 result = socket.next() => {
                     match result {
                         None => break,
                         Some(message) => {
-                            self.handle_message(id, message?).await?;
+                            self.handle_message(id, &epk, message?).await?;
                         }
                     }
                 }
@@ -213,8 +248,8 @@ impl Rustpad {
         Ok(())
     }
 
-    async fn send_initial(&self, id: u64, socket: &mut WebSocket) -> Result<usize> {
-        socket.send(ServerMsg::Identity(id).into()).await?;
+    async fn send_initial(&self, id: u64, socket: &mut WebSocket, epk: &str) -> Result<usize> {
+        socket.send(enc(epk, ServerMsg::Identity(id))).await?;
         let mut messages = Vec::new();
         let revision = {
             let state = self.state.read();
@@ -242,12 +277,12 @@ impl Rustpad {
             state.operations.len()
         };
         for msg in messages {
-            socket.send(msg.into()).await?;
+            socket.send(enc(epk, msg)).await?;
         }
         Ok(revision)
     }
 
-    async fn send_history(&self, start: usize, socket: &mut WebSocket) -> Result<usize> {
+    async fn send_history(&self, start: usize, socket: &mut WebSocket, epk: &str) -> Result<usize> {
         let operations = {
             let state = self.state.read();
             let len = state.operations.len();
@@ -260,16 +295,27 @@ impl Rustpad {
         let num_ops = operations.len();
         if num_ops > 0 {
             let msg = ServerMsg::History { start, operations };
-            socket.send(msg.into()).await?;
+            socket.send(enc(epk, msg)).await?;
         }
         Ok(start + num_ops)
     }
 
-    async fn handle_message(&self, id: u64, message: Message) -> Result<()> {
-        let msg: ClientMsg = match message.to_str() {
-            Ok(text) => serde_json::from_str(text).context("failed to deserialize message")?,
-            Err(()) => return Ok(()), // Ignore non-text messages
+    async fn handle_message(&self, id: u64, epk: &str, message: Message) -> Result<()> {
+        let text = match message.to_str() {
+            Ok(text) => text,
+            Err(()) => return Ok(()), // Ignore non-text messages (ping/pong)
         };
+        // Frames after the handshake are encrypted envelopes; decrypt then parse.
+        let env: crypto::Envelope = match serde_json::from_str(text) {
+            Ok(e) => e,
+            Err(_) => return Ok(()),
+        };
+        let plain = match crypto::keys().open(epk, &env) {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+        let msg: ClientMsg =
+            serde_json::from_slice(&plain).context("failed to deserialize message")?;
         match msg {
             ClientMsg::Edit {
                 revision,

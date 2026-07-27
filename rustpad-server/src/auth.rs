@@ -9,6 +9,7 @@ use log::{info, warn};
 use rand::RngCore;
 use serde::Deserialize;
 use serde_json::json;
+use totp_rs::{Algorithm, Secret, TOTP};
 use warp::{
     http::StatusCode, reject::Reject, reply::Reply, Filter, Rejection,
 };
@@ -19,6 +20,11 @@ use crate::database::{Database, User};
 const SESSION_COOKIE: &str = "authpad_session";
 /// Session lifetime in seconds (7 days).
 const SESSION_MAX_AGE: i64 = 7 * 24 * 3600;
+/// The owner is the master key — its sessions live 12h, not 7 days, to shrink
+/// the window a stolen cookie is useful.
+const ROOT_SESSION_MAX_AGE: i64 = 12 * 3600;
+/// Issuer shown in the authenticator app.
+const TOTP_ISSUER: &str = "Cortex";
 
 /// Rejection used when a request lacks a valid session.
 #[derive(Debug)]
@@ -45,6 +51,54 @@ pub fn hash_password(password: &str) -> anyhow::Result<String> {
 /// Constant-ish password check. Returns false on any error (bad hash, etc.).
 pub fn verify_password(password: &str, hash: &str) -> bool {
     bcrypt::verify(password, hash).unwrap_or(false)
+}
+
+// ----- TOTP (authenticator-app two-factor) -----
+
+fn build_totp(secret_b32: &str, email: &str) -> anyhow::Result<TOTP> {
+    let bytes = Secret::Encoded(secret_b32.to_string())
+        .to_bytes()
+        .map_err(|e| anyhow::anyhow!("bad totp secret: {e:?}"))?;
+    TOTP::new(
+        Algorithm::SHA1,
+        6,
+        1, // ±1 step (30s) of drift tolerance
+        30,
+        bytes,
+        Some(TOTP_ISSUER.to_string()),
+        email.to_string(),
+    )
+    .map_err(|e| anyhow::anyhow!("totp init: {e:?}"))
+}
+
+/// Generate a fresh secret; return (base32 secret, otpauth:// URL) for enrollment.
+pub fn provision_totp(email: &str) -> anyhow::Result<(String, String)> {
+    let mut raw = [0u8; 20];
+    rand::thread_rng().fill_bytes(&mut raw);
+    let secret_b32 = Secret::Raw(raw.to_vec()).to_encoded().to_string();
+    let url = build_totp(&secret_b32, email)?.get_url();
+    Ok((secret_b32, url))
+}
+
+/// Verify a 6-digit code against the stored secret (±1 step for clock drift).
+// ponytail: no replay/last-step tracking — a code stays valid for its ~90s
+// window. Add a totp_last_step column if that window matters.
+pub fn verify_totp(secret_b32: &str, email: &str, code: &str) -> bool {
+    build_totp(secret_b32, email)
+        .ok()
+        .and_then(|t| t.check_current(code.trim()).ok())
+        .unwrap_or(false)
+}
+
+/// Break-glass: if OWNER_2FA_RESET is set on the host, clear 2FA on all owner
+/// accounts at boot so a lost authenticator can't permanently lock out the owner.
+pub async fn maybe_break_glass_owner_2fa(db: &Database) {
+    if std::env::var("OWNER_2FA_RESET").is_ok() {
+        match db.clear_totp_for_roots().await {
+            Ok(n) => warn!("OWNER_2FA_RESET set: cleared 2FA on {n} owner account(s)"),
+            Err(e) => warn!("OWNER_2FA_RESET: could not clear owner 2FA: {e}"),
+        }
+    }
 }
 
 /// Generate a 256-bit random session token, hex-encoded.
@@ -113,6 +167,9 @@ pub async fn seed_from_file(db: &Database, path: &str) {
 struct LoginReq {
     email: String,
     password: String,
+    /// 6-digit TOTP code, present only on the second step of a 2FA login.
+    #[serde(default)]
+    code: Option<String>,
 }
 
 /// A warp filter that requires a valid session and extracts the [`User`].
@@ -154,7 +211,18 @@ pub fn routes(
         .and(with_auth(auth_db))
         .and_then(me_handler);
 
-    login.or(logout).or(me)
+    // Public: the server's ECDH public key for app-layer payload encryption.
+    let crypto_pubkey = warp::path!("crypto" / "pubkey")
+        .and(warp::get())
+        .and_then(crypto_pubkey_handler);
+
+    login.or(logout).or(me).or(crypto_pubkey)
+}
+
+async fn crypto_pubkey_handler() -> Result<impl Reply, Rejection> {
+    Ok(warp::reply::json(
+        &json!({ "pubkey": crate::crypto::keys().public_b64() }),
+    ))
 }
 
 async fn login_handler(body: LoginReq, db: Database) -> Result<impl Reply, Rejection> {
@@ -175,10 +243,37 @@ async fn login_handler(body: LoginReq, db: Database) -> Result<impl Reply, Rejec
         return Ok(warp::reply::with_status(reply, StatusCode::UNAUTHORIZED).into_response());
     }
     let user = user.expect("authed implies user present");
+
+    // Second factor. Password was correct; now require the authenticator code
+    // if this account has 2FA on.
+    if user.totp_enabled {
+        match body.code.as_deref().map(str::trim) {
+            Some(code) if !code.is_empty() => {
+                let ok = user
+                    .totp_secret
+                    .as_deref()
+                    .map(|s| verify_totp(s, &user.email, code))
+                    .unwrap_or(false);
+                if !ok {
+                    let reply = warp::reply::json(&json!({ "error": "invalid code" }));
+                    return Ok(
+                        warp::reply::with_status(reply, StatusCode::UNAUTHORIZED).into_response(),
+                    );
+                }
+            }
+            // Correct password, but we still need the code — no session issued yet.
+            _ => {
+                let reply = warp::reply::json(&json!({ "mfa_required": true }));
+                return Ok(warp::reply::with_status(reply, StatusCode::OK).into_response());
+            }
+        }
+    }
+
     let _ = db.purge_expired_sessions(now_secs()).await; // housekeeping
+    let max_age = if user.role == "root" { ROOT_SESSION_MAX_AGE } else { SESSION_MAX_AGE };
     let token = random_token();
     if db
-        .create_session(&token, user.id, now_secs() + SESSION_MAX_AGE)
+        .create_session(&token, user.id, now_secs() + max_age)
         .await
         .is_err()
     {
@@ -187,10 +282,11 @@ async fn login_handler(body: LoginReq, db: Database) -> Result<impl Reply, Rejec
             warp::reply::with_status(reply, StatusCode::INTERNAL_SERVER_ERROR).into_response(),
         );
     }
+    let _ = db.audit(user.org_id, Some(user.id), "login", None, now_secs()).await;
     // Set COOKIE_SECURE=1 when serving over HTTPS (i.e. any real deployment).
     let secure = if std::env::var("COOKIE_SECURE").is_ok() { "; Secure" } else { "" };
     let cookie = format!(
-        "{SESSION_COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={SESSION_MAX_AGE}{secure}"
+        "{SESSION_COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={max_age}{secure}"
     );
     let reply = warp::reply::json(
         &json!({ "email": user.email, "name": user.name, "role": user.role }),
@@ -212,6 +308,7 @@ async fn me_handler(user: User) -> Result<impl Reply, Rejection> {
         "email": user.email,
         "name": user.name,
         "role": user.role,
+        "mfa": user.totp_enabled,
     })))
 }
 

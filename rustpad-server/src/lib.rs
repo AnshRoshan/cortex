@@ -17,6 +17,7 @@ use crate::{database::Database, rustpad::Rustpad};
 
 pub mod account;
 pub mod auth;
+pub mod crypto;
 pub mod database;
 mod ot;
 mod rustpad;

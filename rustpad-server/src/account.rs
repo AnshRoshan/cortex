@@ -7,7 +7,7 @@ use serde::Deserialize;
 use serde_json::json;
 use warp::{http::StatusCode, reply::Reply, Filter, Rejection};
 
-use crate::auth::{hash_password, verify_password, with_auth, Forbidden};
+use crate::auth::{hash_password, provision_totp, verify_password, verify_totp, with_auth, Forbidden};
 use crate::database::{Database, User};
 
 fn with_db(db: Database) -> impl Filter<Extract = (Database,), Error = Infallible> + Clone {
@@ -69,6 +69,16 @@ struct AdminPasswordReq {
 }
 
 #[derive(Deserialize)]
+struct CodeReq {
+    code: String,
+}
+
+#[derive(Deserialize)]
+struct DisableReq {
+    password: String,
+}
+
+#[derive(Deserialize)]
 struct CreateOrg {
     name: String,
     slug: String,
@@ -93,6 +103,32 @@ pub fn routes(db: Database) -> impl Filter<Extract = (impl Reply,), Error = Reje
         .and(with_db(db.clone()))
         .and(warp::body::json())
         .and_then(change_password);
+
+    let tfa_setup = warp::path!("2fa" / "setup")
+        .and(warp::post())
+        .and(with_auth(db.clone()))
+        .and(with_db(db.clone()))
+        .and_then(setup_2fa);
+
+    let tfa_enable = warp::path!("2fa" / "enable")
+        .and(warp::post())
+        .and(with_auth(db.clone()))
+        .and(with_db(db.clone()))
+        .and(warp::body::json())
+        .and_then(enable_2fa);
+
+    let tfa_disable = warp::path!("2fa" / "disable")
+        .and(warp::post())
+        .and(with_auth(db.clone()))
+        .and(with_db(db.clone()))
+        .and(warp::body::json())
+        .and_then(disable_2fa);
+
+    let admin_reset_tfa = warp::path!("admin" / "users" / i64 / "2fa" / "reset")
+        .and(warp::post())
+        .and(with_auth(db.clone()))
+        .and(with_db(db.clone()))
+        .and_then(admin_reset_2fa);
 
     let admin_list = warp::path!("admin" / "users")
         .and(warp::get())
@@ -155,6 +191,10 @@ pub fn routes(db: Database) -> impl Filter<Extract = (impl Reply,), Error = Reje
 
     update_name
         .or(change_pw)
+        .or(tfa_setup)
+        .or(tfa_enable)
+        .or(tfa_disable)
+        .or(admin_reset_tfa)
         .or(admin_list)
         .or(admin_create)
         .or(admin_reset_pw)
@@ -201,6 +241,56 @@ async fn change_password(
     Ok(warp::reply::json(&json!({ "ok": true })).into_response())
 }
 
+// ----- two-factor (TOTP) self-service -----
+
+async fn setup_2fa(user: User, db: Database) -> Result<impl Reply, Rejection> {
+    let (secret, url) = match provision_totp(&user.email) {
+        Ok(v) => v,
+        Err(_) => return Ok(err(StatusCode::INTERNAL_SERVER_ERROR, "could not start setup")),
+    };
+    if db.set_totp_pending(user.id, &secret).await.is_err() {
+        return Ok(err(StatusCode::INTERNAL_SERVER_ERROR, "could not start setup"));
+    }
+    Ok(warp::reply::json(&json!({ "secret": secret, "otpauth_url": url })).into_response())
+}
+
+async fn enable_2fa(user: User, db: Database, body: CodeReq) -> Result<impl Reply, Rejection> {
+    let secret = match &user.totp_secret {
+        Some(_) if user.totp_enabled => return Ok(err(StatusCode::BAD_REQUEST, "two-factor is already on")),
+        Some(s) => s,
+        None => return Ok(err(StatusCode::BAD_REQUEST, "start setup first")),
+    };
+    if !verify_totp(secret, &user.email, body.code.trim()) {
+        return Ok(err(StatusCode::BAD_REQUEST, "that code isn't right — enter the current one"));
+    }
+    if db.enable_totp(user.id).await.is_err() {
+        return Ok(err(StatusCode::INTERNAL_SERVER_ERROR, "could not enable"));
+    }
+    Ok(warp::reply::json(&json!({ "ok": true })).into_response())
+}
+
+async fn disable_2fa(user: User, db: Database, body: DisableReq) -> Result<impl Reply, Rejection> {
+    // Require the password so a walk-up session can't silently strip 2FA.
+    if !verify_password(&body.password, &user.password_hash) {
+        return Ok(err(StatusCode::BAD_REQUEST, "password is incorrect"));
+    }
+    if db.clear_totp(user.id).await.is_err() {
+        return Ok(err(StatusCode::INTERNAL_SERVER_ERROR, "could not disable"));
+    }
+    Ok(warp::reply::json(&json!({ "ok": true })).into_response())
+}
+
+/// Owner recovery: clear a user's 2FA if they lose their authenticator.
+async fn admin_reset_2fa(target: i64, user: User, db: Database) -> Result<impl Reply, Rejection> {
+    require_root(&user)?;
+    if db.clear_totp(target).await.is_err() {
+        return Ok(err(StatusCode::INTERNAL_SERVER_ERROR, "could not reset two-factor"));
+    }
+    let d = target.to_string();
+    let _ = db.audit(user.org_id, Some(user.id), "admin_reset_2fa", Some(&d), now_secs()).await;
+    Ok(warp::reply::json(&json!({ "ok": true })).into_response())
+}
+
 async fn admin_list(user: User, db: Database) -> Result<impl Reply, Rejection> {
     require_root(&user)?;
     let users = db.admin_list_users().await.unwrap_or_default();
@@ -226,7 +316,10 @@ async fn admin_create(user: User, db: Database, body: NewUserReq) -> Result<impl
         .create_user_if_absent(email, body.name.trim(), &hash, role, body.org_id)
         .await
     {
-        Ok(true) => Ok(warp::reply::json(&json!({ "ok": true })).into_response()),
+        Ok(true) => {
+            let _ = db.audit(user.org_id, Some(user.id), "admin_create_user", Some(email), now_secs()).await;
+            Ok(warp::reply::json(&json!({ "ok": true })).into_response())
+        }
         Ok(false) => Ok(err(StatusCode::CONFLICT, "a user with that email already exists")),
         Err(_) => Ok(err(StatusCode::INTERNAL_SERVER_ERROR, "could not create user")),
     }
@@ -252,6 +345,8 @@ async fn admin_reset_password(
     if db.update_password(target, &hash).await.is_err() {
         return Ok(err(StatusCode::INTERNAL_SERVER_ERROR, "could not reset password"));
     }
+    let d = target.to_string();
+    let _ = db.audit(user.org_id, Some(user.id), "admin_reset_password", Some(&d), now_secs()).await;
     Ok(warp::reply::json(&json!({ "ok": true })).into_response())
 }
 
@@ -279,6 +374,8 @@ async fn admin_update_user(
 async fn admin_delete(target: i64, user: User, db: Database) -> Result<impl Reply, Rejection> {
     require_root(&user)?;
     let _ = db.admin_delete_user(target).await;
+    let d = target.to_string();
+    let _ = db.audit(user.org_id, Some(user.id), "admin_delete_user", Some(&d), now_secs()).await;
     Ok(warp::reply::json(&json!({ "ok": true })))
 }
 

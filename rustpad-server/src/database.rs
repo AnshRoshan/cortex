@@ -4,6 +4,7 @@
 //! assigned to at most one org (by the root owner). Access to a workspace is by
 //! org membership; the root owner bypasses org checks (full cross-org access).
 
+use std::collections::HashMap;
 use std::str::FromStr;
 
 use anyhow::{bail, Result};
@@ -34,6 +35,10 @@ pub struct User {
     pub role: String,
     /// Org the user is assigned to (None for root / unassigned).
     pub org_id: Option<i64>,
+    /// Base32 TOTP secret, if the user has started 2FA enrollment (None = never set).
+    pub totp_secret: Option<String>,
+    /// True once the user has confirmed 2FA with a valid code; login then requires it.
+    pub totp_enabled: bool,
 }
 
 /// A user as shown in the root admin console (never includes root accounts).
@@ -143,6 +148,52 @@ pub struct ChatMessage {
     pub email: String,
     /// Unix seconds.
     pub created_at: i64,
+    /// When the message was last edited (None if never).
+    pub edited_at: Option<i64>,
+}
+
+/// One emoji's tally on a message, from the requesting user's point of view.
+#[derive(Serialize, PartialEq, Eq, Clone, Debug)]
+pub struct ReactionView {
+    /// The emoji.
+    pub emoji: String,
+    /// How many people reacted with it.
+    pub count: i64,
+    /// Whether the requesting user is one of them.
+    pub mine: bool,
+}
+
+/// Group flat (msg_id, emoji, user_id) rows into per-message reaction tallies,
+/// marking which are the requesting user's. Preserves first-seen emoji order.
+fn group_reactions(rows: Vec<(i64, String, i64)>, me: i64) -> HashMap<i64, Vec<ReactionView>> {
+    let mut map: HashMap<i64, Vec<ReactionView>> = HashMap::new();
+    for (msg_id, emoji, user_id) in rows {
+        let list = map.entry(msg_id).or_default();
+        if let Some(rv) = list.iter_mut().find(|rv| rv.emoji == emoji) {
+            rv.count += 1;
+            rv.mine |= user_id == me;
+        } else {
+            list.push(ReactionView { emoji, count: 1, mine: user_id == me });
+        }
+    }
+    map
+}
+
+/// One audit-log entry, joined to its actor's identity for display.
+#[derive(sqlx::FromRow, Serialize, PartialEq, Eq, Clone, Debug)]
+pub struct AuditEntry {
+    /// Primary key.
+    pub id: i64,
+    /// Action slug, e.g. "login", "download", "delete_file".
+    pub action: String,
+    /// Optional human detail (a path, a target email, …).
+    pub detail: Option<String>,
+    /// Actor email ("system" for actorless events).
+    pub email: String,
+    /// Actor display name.
+    pub name: String,
+    /// Unix seconds.
+    pub created_at: i64,
 }
 
 /// A member of an org, as returned to the client.
@@ -246,7 +297,7 @@ impl Database {
     /// Look up a user by email for login.
     pub async fn get_user_by_email(&self, email: &str) -> Result<Option<User>> {
         sqlx::query_as(
-            r#"SELECT id, email, name, password_hash, role, org_id FROM users WHERE email = $1"#,
+            r#"SELECT id, email, name, password_hash, role, org_id, totp_secret, totp_enabled FROM users WHERE email = $1"#,
         )
         .bind(email)
         .fetch_optional(&self.pool)
@@ -274,6 +325,42 @@ impl Database {
         Ok(())
     }
 
+    /// Store a pending TOTP secret (enrollment started but not yet confirmed).
+    pub async fn set_totp_pending(&self, user_id: i64, secret: &str) -> Result<()> {
+        sqlx::query(r#"UPDATE users SET totp_secret = $1, totp_enabled = 0 WHERE id = $2"#)
+            .bind(secret)
+            .bind(user_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Flip TOTP on after the first code is verified.
+    pub async fn enable_totp(&self, user_id: i64) -> Result<()> {
+        sqlx::query(r#"UPDATE users SET totp_enabled = 1 WHERE id = $1"#)
+            .bind(user_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Remove TOTP entirely (user turn-off, or owner recovery / break-glass reset).
+    pub async fn clear_totp(&self, user_id: i64) -> Result<()> {
+        sqlx::query(r#"UPDATE users SET totp_secret = NULL, totp_enabled = 0 WHERE id = $1"#)
+            .bind(user_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Clear TOTP for every root/owner account. Host-level break-glass on boot.
+    pub async fn clear_totp_for_roots(&self) -> Result<u64> {
+        let r = sqlx::query(r#"UPDATE users SET totp_secret = NULL, totp_enabled = 0 WHERE role = 'root'"#)
+            .execute(&self.pool)
+            .await?;
+        Ok(r.rows_affected())
+    }
+
     /// Create a session row.
     pub async fn create_session(&self, token: &str, user_id: i64, expires_at: i64) -> Result<()> {
         sqlx::query(r#"INSERT INTO session (token, user_id, expires_at) VALUES ($1, $2, $3)"#)
@@ -288,7 +375,7 @@ impl Database {
     /// Resolve a session token to its user, only if the session is unexpired.
     pub async fn get_session_user(&self, token: &str, now: i64) -> Result<Option<User>> {
         sqlx::query_as(
-            r#"SELECT u.id, u.email, u.name, u.password_hash, u.role, u.org_id
+            r#"SELECT u.id, u.email, u.name, u.password_hash, u.role, u.org_id, u.totp_secret, u.totp_enabled
                FROM session s JOIN users u ON u.id = s.user_id
                WHERE s.token = $1 AND s.expires_at > $2"#,
         )
@@ -726,20 +813,15 @@ impl Database {
         Ok(())
     }
 
-    // ----- Chat (org-wide) -----
+    // ----- Workspace group chat -----
 
-    /// Post a chat message to an org.
-    pub async fn create_message(
-        &self,
-        org_id: i64,
-        user_id: i64,
-        body: &str,
-        now: i64,
-    ) -> Result<()> {
+    /// Post a message to a workspace's group chat (org_id derived from workspace).
+    pub async fn create_message(&self, workspace_id: i64, user_id: i64, body: &str, now: i64) -> Result<()> {
         sqlx::query(
-            r#"INSERT INTO message (org_id, user_id, body, created_at) VALUES ($1, $2, $3, $4)"#,
+            r#"INSERT INTO message (workspace_id, org_id, user_id, body, created_at)
+               VALUES ($1, (SELECT org_id FROM workspace WHERE id = $1), $2, $3, $4)"#,
         )
-        .bind(org_id)
+        .bind(workspace_id)
         .bind(user_id)
         .bind(body)
         .bind(now)
@@ -748,18 +830,284 @@ impl Database {
         Ok(())
     }
 
-    /// The most recent messages in an org, oldest-first.
-    pub async fn list_messages(&self, org_id: i64, limit: i64) -> Result<Vec<ChatMessage>> {
+    /// The most recent messages in a workspace, oldest-first.
+    pub async fn list_messages(&self, workspace_id: i64, limit: i64) -> Result<Vec<ChatMessage>> {
         let mut rows: Vec<ChatMessage> = sqlx::query_as(
-            r#"SELECT m.id, m.body, u.name AS author, u.email AS email, m.created_at
+            r#"SELECT m.id, m.body, u.name AS author, u.email AS email, m.created_at, m.edited_at
                FROM message m JOIN users u ON u.id = m.user_id
-               WHERE m.org_id = $1 ORDER BY m.id DESC LIMIT $2"#,
+               WHERE m.workspace_id = $1 ORDER BY m.id DESC LIMIT $2"#,
         )
-        .bind(org_id)
+        .bind(workspace_id)
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
         rows.reverse();
         Ok(rows)
+    }
+
+    /// Edit a group-chat message's body — only the author may do so. Returns
+    /// true if a row was actually changed (false = not yours / not found).
+    pub async fn edit_message(&self, id: i64, user_id: i64, body: &str, now: i64) -> Result<bool> {
+        let r = sqlx::query(
+            r#"UPDATE message SET body = $1, edited_at = $2 WHERE id = $3 AND user_id = $4"#,
+        )
+        .bind(body)
+        .bind(now)
+        .bind(id)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(r.rows_affected() > 0)
+    }
+
+    /// Delete a group-chat message — only the author. Returns true if removed.
+    pub async fn delete_message(&self, id: i64, user_id: i64) -> Result<bool> {
+        let r = sqlx::query(r#"DELETE FROM message WHERE id = $1 AND user_id = $2"#)
+            .bind(id)
+            .bind(user_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(r.rows_affected() > 0)
+    }
+
+    /// Clear a workspace's group chat (admin/root only — enforced at the route).
+    pub async fn clear_messages(&self, workspace_id: i64) -> Result<()> {
+        sqlx::query(r#"DELETE FROM message WHERE workspace_id = $1"#)
+            .bind(workspace_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    // ----- Direct messages (org-wide, 1:1) -----
+
+    /// The org a user belongs to (for validating a DM peer is a co-member).
+    pub async fn user_org(&self, user_id: i64) -> Result<Option<i64>> {
+        let row: Option<(Option<i64>,)> =
+            sqlx::query_as(r#"SELECT org_id FROM users WHERE id = $1"#)
+                .bind(user_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.and_then(|r| r.0))
+    }
+
+    /// Send a direct message from `sender` to `recipient` within an org.
+    pub async fn create_dm(&self, org_id: i64, sender: i64, recipient: i64, body: &str, now: i64) -> Result<()> {
+        sqlx::query(
+            r#"INSERT INTO dm (org_id, sender_id, recipient_id, body, created_at)
+               VALUES ($1, $2, $3, $4, $5)"#,
+        )
+        .bind(org_id)
+        .bind(sender)
+        .bind(recipient)
+        .bind(body)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// The conversation between two users in an org, oldest-first.
+    pub async fn list_dm(&self, org_id: i64, a: i64, b: i64, limit: i64) -> Result<Vec<ChatMessage>> {
+        let mut rows: Vec<ChatMessage> = sqlx::query_as(
+            r#"SELECT d.id, d.body, u.name AS author, u.email AS email, d.created_at, d.edited_at
+               FROM dm d JOIN users u ON u.id = d.sender_id
+               WHERE d.org_id = $1
+                 AND ((d.sender_id = $2 AND d.recipient_id = $3)
+                   OR (d.sender_id = $3 AND d.recipient_id = $2))
+               ORDER BY d.id DESC LIMIT $4"#,
+        )
+        .bind(org_id)
+        .bind(a)
+        .bind(b)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.reverse();
+        Ok(rows)
+    }
+
+    /// Edit a direct message's body — only the sender. Returns true if changed.
+    pub async fn edit_dm(&self, id: i64, sender_id: i64, body: &str, now: i64) -> Result<bool> {
+        let r = sqlx::query(
+            r#"UPDATE dm SET body = $1, edited_at = $2 WHERE id = $3 AND sender_id = $4"#,
+        )
+        .bind(body)
+        .bind(now)
+        .bind(id)
+        .bind(sender_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(r.rows_affected() > 0)
+    }
+
+    /// Delete a direct message — only the sender. Returns true if removed.
+    pub async fn delete_dm_message(&self, id: i64, sender_id: i64) -> Result<bool> {
+        let r = sqlx::query(r#"DELETE FROM dm WHERE id = $1 AND sender_id = $2"#)
+            .bind(id)
+            .bind(sender_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(r.rows_affected() > 0)
+    }
+
+    /// Clear the whole conversation between two users (either party may do this).
+    pub async fn clear_dm(&self, org_id: i64, a: i64, b: i64) -> Result<()> {
+        sqlx::query(
+            r#"DELETE FROM dm WHERE org_id = $1
+               AND ((sender_id = $2 AND recipient_id = $3)
+                 OR (sender_id = $3 AND recipient_id = $2))"#,
+        )
+        .bind(org_id)
+        .bind(a)
+        .bind(b)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    // ----- Presence (heartbeat) -----
+
+    /// Record that a user was just seen (heartbeat).
+    pub async fn touch_last_seen(&self, user_id: i64, now: i64) -> Result<()> {
+        sqlx::query(r#"UPDATE users SET last_seen = $1 WHERE id = $2"#)
+            .bind(now)
+            .bind(user_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// (user_id, last_seen) for everyone in an org.
+    pub async fn org_presence(&self, org_id: i64) -> Result<Vec<(i64, i64)>> {
+        let rows: Vec<(i64, i64)> =
+            sqlx::query_as(r#"SELECT id, last_seen FROM users WHERE org_id = $1"#)
+                .bind(org_id)
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(rows)
+    }
+
+    // ----- Reactions -----
+
+    /// Toggle a user's emoji reaction on a message (add if absent, else remove).
+    pub async fn toggle_reaction(&self, kind: &str, msg_id: i64, user_id: i64, emoji: &str) -> Result<()> {
+        let del = sqlx::query(
+            r#"DELETE FROM reaction WHERE kind = $1 AND msg_id = $2 AND user_id = $3 AND emoji = $4"#,
+        )
+        .bind(kind)
+        .bind(msg_id)
+        .bind(user_id)
+        .bind(emoji)
+        .execute(&self.pool)
+        .await?;
+        if del.rows_affected() == 0 {
+            sqlx::query(
+                r#"INSERT INTO reaction (kind, msg_id, user_id, emoji) VALUES ($1, $2, $3, $4)"#,
+            )
+            .bind(kind)
+            .bind(msg_id)
+            .bind(user_id)
+            .bind(emoji)
+            .execute(&self.pool)
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Reactions for every message in a workspace's group chat, keyed by msg id.
+    pub async fn reactions_for_workspace(&self, workspace_id: i64, me: i64) -> Result<HashMap<i64, Vec<ReactionView>>> {
+        let rows: Vec<(i64, String, i64)> = sqlx::query_as(
+            r#"SELECT r.msg_id, r.emoji, r.user_id
+               FROM reaction r JOIN message m ON m.id = r.msg_id
+               WHERE r.kind = 'ws' AND m.workspace_id = $1"#,
+        )
+        .bind(workspace_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(group_reactions(rows, me))
+    }
+
+    /// Reactions for every message in a 1:1 conversation, keyed by msg id.
+    pub async fn reactions_for_dm(&self, org_id: i64, a: i64, b: i64, me: i64) -> Result<HashMap<i64, Vec<ReactionView>>> {
+        let rows: Vec<(i64, String, i64)> = sqlx::query_as(
+            r#"SELECT r.msg_id, r.emoji, r.user_id
+               FROM reaction r JOIN dm d ON d.id = r.msg_id
+               WHERE r.kind = 'dm' AND d.org_id = $1
+                 AND ((d.sender_id = $2 AND d.recipient_id = $3)
+                   OR (d.sender_id = $3 AND d.recipient_id = $2))"#,
+        )
+        .bind(org_id)
+        .bind(a)
+        .bind(b)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(group_reactions(rows, me))
+    }
+
+    // ----- Audit log -----
+
+    /// Append an audit entry. Best-effort — callers ignore the result.
+    pub async fn audit(&self, org_id: Option<i64>, user_id: Option<i64>, action: &str, detail: Option<&str>, now: i64) -> Result<()> {
+        sqlx::query(
+            r#"INSERT INTO audit (org_id, user_id, action, detail, created_at) VALUES ($1, $2, $3, $4, $5)"#,
+        )
+        .bind(org_id)
+        .bind(user_id)
+        .bind(action)
+        .bind(detail)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Recent audit entries: an org's when `all` is false, otherwise every org's
+    /// (root view). Newest first.
+    pub async fn list_audit(&self, org_id: Option<i64>, all: bool, limit: i64) -> Result<Vec<AuditEntry>> {
+        let base = r#"SELECT a.id, a.action, a.detail,
+                             COALESCE(u.email, 'system') AS email,
+                             COALESCE(u.name, 'system') AS name,
+                             a.created_at
+                      FROM audit a LEFT JOIN users u ON u.id = a.user_id"#;
+        let rows = if all {
+            sqlx::query_as::<_, AuditEntry>(&format!("{base} ORDER BY a.id DESC LIMIT $1"))
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?
+        } else {
+            sqlx::query_as::<_, AuditEntry>(&format!("{base} WHERE a.org_id = $1 ORDER BY a.id DESC LIMIT $2"))
+                .bind(org_id)
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?
+        };
+        Ok(rows)
+    }
+
+    // ----- Chat images (org-scoped blobs, separate from workspace files) -----
+
+    /// Store a pasted chat image and return its id.
+    pub async fn create_chat_image(&self, org_id: i64, mime: Option<&str>, data: &[u8], now: i64) -> Result<i64> {
+        let row: (i64,) = sqlx::query_as(
+            r#"INSERT INTO chat_image (org_id, mime, data, created_at) VALUES ($1, $2, $3, $4) RETURNING id"#,
+        )
+        .bind(org_id)
+        .bind(mime)
+        .bind(data)
+        .bind(now)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.0)
+    }
+
+    /// Load a chat image: (org_id, mime, bytes).
+    pub async fn get_chat_image(&self, id: i64) -> Result<Option<(i64, Option<String>, Vec<u8>)>> {
+        let row: Option<(i64, Option<String>, Vec<u8>)> =
+            sqlx::query_as(r#"SELECT org_id, mime, data FROM chat_image WHERE id = $1"#)
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row)
     }
 }

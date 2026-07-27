@@ -4,7 +4,9 @@
 //! act within any org (passing `?org=<id>`). Any org member can create and open
 //! every workspace in their org. Chat is org-wide.
 
+use std::collections::HashMap;
 use std::convert::Infallible;
+use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Buf;
@@ -16,7 +18,65 @@ use warp::multipart::{FormData, Part};
 use warp::{http::StatusCode, hyper::Body, reply::Reply, Filter, Rejection};
 
 use crate::auth::{with_auth, Forbidden};
-use crate::database::{Database, User, Workspace};
+use crate::crypto;
+use crate::database::{ChatMessage, Database, ReactionView, User, Workspace};
+
+/// Filter extracting the client's ECDH public key header (present when the
+/// client encrypts the payload).
+fn epk_header() -> impl Filter<Extract = (Option<String>,), Error = Rejection> + Clone {
+    warp::header::optional::<String>("x-cortex-epk")
+}
+
+/// Ephemeral "who is typing" state. In-memory only (single process): scope
+/// string -> user_id -> last-typed unix time. ponytail: a process-global mutex
+/// is plenty for one container; move to Redis only if this ever runs multi-node.
+fn typing_state() -> &'static Mutex<HashMap<String, HashMap<i64, i64>>> {
+    static S: OnceLock<Mutex<HashMap<String, HashMap<i64, i64>>>> = OnceLock::new();
+    S.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// A typist counts as "typing" for this many seconds after their last keystroke.
+const TYPING_TTL: i64 = 6;
+
+fn mark_typing(scope: String, user_id: i64, now: i64) {
+    typing_state().lock().unwrap().entry(scope).or_default().insert(user_id, now);
+}
+
+/// Who (other than `exclude`) is currently typing in `scope`; also prunes stale entries.
+fn who_typing(scope: &str, exclude: i64, now: i64) -> Vec<i64> {
+    let mut g = typing_state().lock().unwrap();
+    match g.get_mut(scope) {
+        Some(m) => {
+            m.retain(|_, t| now - *t < TYPING_TTL);
+            m.keys().copied().filter(|&id| id != exclude).collect()
+        }
+        None => Vec::new(),
+    }
+}
+
+/// Canonical scope key for a 1:1 conversation (order-independent).
+fn dm_scope(a: i64, b: i64) -> String {
+    let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+    format!("dm:{lo}:{hi}")
+}
+
+/// Serialize messages to JSON, folding each message's reactions in under a
+/// `reactions` key. Kept out of the SQL struct because sqlx can't decode a
+/// computed Vec field.
+fn attach_reactions(
+    messages: Vec<ChatMessage>,
+    mut reactions: HashMap<i64, Vec<ReactionView>>,
+) -> Vec<serde_json::Value> {
+    messages
+        .into_iter()
+        .map(|m| {
+            let r = reactions.remove(&m.id).unwrap_or_default();
+            let mut v = serde_json::to_value(&m).unwrap_or_else(|_| json!({}));
+            v["reactions"] = json!(r);
+            v
+        })
+        .collect()
+}
 
 fn now_secs() -> i64 {
     SystemTime::now()
@@ -120,6 +180,32 @@ struct ChatPost {
     body: String,
 }
 
+#[derive(Deserialize)]
+struct EditBody {
+    body: String,
+}
+
+#[derive(Deserialize)]
+struct ChatQuery {
+    workspace_id: i64,
+}
+
+#[derive(Deserialize)]
+struct DmQuery {
+    with: i64,
+    #[serde(default)]
+    org: Option<i64>,
+}
+
+/// The org a DM acts within: the user's own, or (for root) `?org=`.
+fn dm_org(user: &User, q: &DmQuery) -> Option<i64> {
+    if user.role == "root" {
+        q.org
+    } else {
+        user.org_id
+    }
+}
+
 pub fn routes(db: Database) -> impl Filter<Extract = (impl Reply,), Error = Rejection> + Clone {
     let get_org = warp::path!("org")
         .and(warp::get())
@@ -195,22 +281,149 @@ pub fn routes(db: Database) -> impl Filter<Extract = (impl Reply,), Error = Reje
         .and(with_db(db.clone()))
         .and_then(delete_file);
 
+    // Workspace group chat.
     let get_chat_r = warp::path!("chat")
         .and(warp::get())
         .and(with_auth(db.clone()))
         .and(with_db(db.clone()))
-        .and(warp::query::<OrgQuery>())
+        .and(warp::query::<ChatQuery>())
+        .and(epk_header())
         .and_then(get_chat);
 
     let post_chat_r = warp::path!("chat")
         .and(warp::post())
         .and(with_auth(db.clone()))
-        .and(with_db(db))
-        .and(warp::query::<OrgQuery>())
-        .and(warp::body::json())
+        .and(with_db(db.clone()))
+        .and(warp::query::<ChatQuery>())
+        .and(epk_header())
+        .and(warp::body::bytes())
         .and_then(post_chat);
 
-    get_org
+    let clear_chat_r = warp::path!("chat")
+        .and(warp::delete())
+        .and(with_auth(db.clone()))
+        .and(with_db(db.clone()))
+        .and(warp::query::<ChatQuery>())
+        .and_then(clear_chat);
+
+    // Org-wide 1:1 direct messages.
+    let get_dm_r = warp::path!("dm")
+        .and(warp::get())
+        .and(with_auth(db.clone()))
+        .and(with_db(db.clone()))
+        .and(warp::query::<DmQuery>())
+        .and(epk_header())
+        .and_then(get_dm);
+
+    let post_dm_r = warp::path!("dm")
+        .and(warp::post())
+        .and(with_auth(db.clone()))
+        .and(with_db(db.clone()))
+        .and(warp::query::<DmQuery>())
+        .and(epk_header())
+        .and(warp::body::bytes())
+        .and_then(post_dm);
+
+    let clear_dm_r = warp::path!("dm")
+        .and(warp::delete())
+        .and(with_auth(db.clone()))
+        .and(with_db(db.clone()))
+        .and(warp::query::<DmQuery>())
+        .and_then(clear_dm);
+
+    // Per-message edit / delete (author-scoped). `chat / i64` vs `chat` keeps
+    // these distinct from the "clear whole thread" routes above.
+    let edit_chat_r = warp::path!("chat" / i64)
+        .and(warp::patch())
+        .and(with_auth(db.clone()))
+        .and(with_db(db.clone()))
+        .and(epk_header())
+        .and(warp::body::bytes())
+        .and_then(edit_chat);
+
+    let delete_chat_msg_r = warp::path!("chat" / i64)
+        .and(warp::delete())
+        .and(with_auth(db.clone()))
+        .and(with_db(db.clone()))
+        .and_then(delete_chat_msg);
+
+    let edit_dm_r = warp::path!("dm" / i64)
+        .and(warp::patch())
+        .and(with_auth(db.clone()))
+        .and(with_db(db.clone()))
+        .and(epk_header())
+        .and(warp::body::bytes())
+        .and_then(edit_dm);
+
+    let delete_dm_msg_r = warp::path!("dm" / i64)
+        .and(warp::delete())
+        .and(with_auth(db.clone()))
+        .and(with_db(db.clone()))
+        .and_then(delete_dm_msg);
+
+    // Typing pings ("chat"/"dm" + literal "typing" — distinct from the /{id} routes).
+    let typing_chat_r = warp::path!("chat" / "typing")
+        .and(warp::post())
+        .and(with_auth(db.clone()))
+        .and(with_db(db.clone()))
+        .and(warp::query::<ChatQuery>())
+        .and_then(typing_chat);
+
+    let typing_dm_r = warp::path!("dm" / "typing")
+        .and(warp::post())
+        .and(with_auth(db.clone()))
+        .and(with_db(db.clone()))
+        .and(warp::query::<DmQuery>())
+        .and_then(typing_dm);
+
+    // Emoji reactions (toggle).
+    let react_r = warp::path!("reaction")
+        .and(warp::post())
+        .and(with_auth(db.clone()))
+        .and(with_db(db.clone()))
+        .and(epk_header())
+        .and(warp::body::bytes())
+        .and_then(toggle_reaction);
+
+    // Presence: GET the org roster's online state, POST a heartbeat.
+    let presence_get_r = warp::path!("presence")
+        .and(warp::get())
+        .and(with_auth(db.clone()))
+        .and(with_db(db.clone()))
+        .and(warp::query::<OrgQuery>())
+        .and_then(presence_get);
+
+    let presence_ping_r = warp::path!("presence")
+        .and(warp::post())
+        .and(with_auth(db.clone()))
+        .and(with_db(db.clone()))
+        .and_then(presence_ping);
+
+    let audit_r = warp::path!("audit")
+        .and(warp::get())
+        .and(with_auth(db.clone()))
+        .and(with_db(db.clone()))
+        .and_then(audit_log);
+
+    // Chat images (pasted into chat) — stored separately from workspace files.
+    let post_chat_image = warp::path!("chat-image")
+        .and(warp::post())
+        .and(with_auth(db.clone()))
+        .and(with_db(db.clone()))
+        .and(warp::query::<OrgQuery>())
+        .and(warp::multipart::form().max_length(16 * 1024 * 1024))
+        .and_then(upload_chat_image);
+
+    let get_chat_image_r = warp::path!("chat-image" / i64)
+        .and(warp::get())
+        .and(with_auth(db.clone()))
+        .and(with_db(db))
+        .and_then(get_chat_image);
+
+    // Box the two halves: warp's `.or()` builds a deeply-nested type, and past
+    // ~two-dozen routes the compiler overflows resolving it (E0275). `.boxed()`
+    // erases each half's type so the final combination stays shallow.
+    let workspace_routes = get_org
         .or(create_ws)
         .or(upload)
         .or(raw)
@@ -221,8 +434,29 @@ pub fn routes(db: Database) -> impl Filter<Extract = (impl Reply,), Error = Reje
         .or(create_file)
         .or(move_file)
         .or(delete_file)
-        .or(get_chat_r)
+        .or(audit_r)
+        .boxed();
+
+    let chat_routes = get_chat_r
         .or(post_chat_r)
+        .or(clear_chat_r)
+        .or(get_dm_r)
+        .or(post_dm_r)
+        .or(clear_dm_r)
+        .or(edit_chat_r)
+        .or(delete_chat_msg_r)
+        .or(edit_dm_r)
+        .or(delete_dm_msg_r)
+        .or(typing_chat_r)
+        .or(typing_dm_r)
+        .or(react_r)
+        .or(presence_get_r)
+        .or(presence_ping_r)
+        .or(post_chat_image)
+        .or(get_chat_image_r)
+        .boxed();
+
+    workspace_routes.or(chat_routes)
 }
 
 async fn get_org(user: User, db: Database, q: OrgQuery) -> Result<impl Reply, Rejection> {
@@ -302,7 +536,10 @@ async fn create_file(user: User, db: Database, body: CreateFile) -> Result<impl 
         .create_file(body.workspace_id, &path, &doc_id, "text", None, now_secs())
         .await
     {
-        Ok(file) => Ok(warp::reply::json(&json!({ "file": file })).into_response()),
+        Ok(file) => {
+            let _ = db.audit(user.org_id, Some(user.id), "create_file", Some(&path), now_secs()).await;
+            Ok(warp::reply::json(&json!({ "file": file })).into_response())
+        }
         Err(_) => Ok(err(
             StatusCode::BAD_REQUEST,
             "could not create file (name may already exist)",
@@ -366,6 +603,7 @@ async fn upload_file(
     if db.store_blob(file.id, &bytes).await.is_err() {
         return Ok(err(StatusCode::INTERNAL_SERVER_ERROR, "could not store file"));
     }
+    let _ = db.audit(user.org_id, Some(user.id), "upload", Some(&filename), now_secs()).await;
     Ok(warp::reply::json(&json!({ "file": file })).into_response())
 }
 
@@ -403,6 +641,7 @@ async fn download_file(file_id: i64, user: User, db: Database) -> Result<impl Re
         Some(f) => f,
         None => return Ok(err(StatusCode::NOT_FOUND, "no such file")),
     };
+    let _ = db.audit(user.org_id, Some(user.id), "download", Some(&file.path), now_secs()).await;
     let bytes: Vec<u8> = if file.kind == "binary" {
         db.load_blob(file.id).await.ok().flatten().unwrap_or_default()
     } else {
@@ -434,7 +673,9 @@ async fn delete_file(file_id: i64, user: User, db: Database) -> Result<impl Repl
     if !file_allowed(&db, &user, file_id).await {
         return Err(warp::reject::custom(Forbidden));
     }
+    let path = db.get_file(file_id).await.ok().flatten().map(|f| f.path);
     let _ = db.delete_file(file_id).await;
+    let _ = db.audit(user.org_id, Some(user.id), "delete_file", path.as_deref(), now_secs()).await;
     Ok(warp::reply::json(&json!({ "ok": true })).into_response())
 }
 
@@ -457,23 +698,33 @@ async fn move_file(
     }
 }
 
-async fn get_chat(user: User, db: Database, q: OrgQuery) -> Result<impl Reply, Rejection> {
-    let messages = match acting_org(&user, &q) {
-        Some(oid) => db.list_messages(oid, 300).await.unwrap_or_default(),
-        None => Vec::new(),
-    };
-    Ok(warp::reply::json(&json!({ "messages": messages })))
+async fn get_chat(
+    user: User,
+    db: Database,
+    q: ChatQuery,
+    epk: Option<String>,
+) -> Result<impl Reply, Rejection> {
+    ensure_ws(&db, &user, q.workspace_id).await?;
+    let messages = db.list_messages(q.workspace_id, 300).await.unwrap_or_default();
+    let reactions = db.reactions_for_workspace(q.workspace_id, user.id).await.unwrap_or_default();
+    let messages = attach_reactions(messages, reactions);
+    let typing = who_typing(&format!("ws:{}", q.workspace_id), user.id, now_secs());
+    Ok(crypto::seal_reply(&epk, &json!({ "messages": messages, "typing": typing })))
 }
 
 async fn post_chat(
     user: User,
     db: Database,
-    q: OrgQuery,
-    body: ChatPost,
+    q: ChatQuery,
+    epk: Option<String>,
+    raw: bytes::Bytes,
 ) -> Result<impl Reply, Rejection> {
-    let org_id = match acting_org(&user, &q) {
-        Some(o) => o,
-        None => return Ok(err(StatusCode::FORBIDDEN, "no org")),
+    ensure_ws(&db, &user, q.workspace_id).await?;
+    let body: ChatPost = match crypto::open_request(&epk, &raw)
+        .and_then(|b| serde_json::from_slice(&b).ok())
+    {
+        Some(v) => v,
+        None => return Ok(err(StatusCode::BAD_REQUEST, "bad payload")),
     };
     let text = body.body.trim();
     if text.is_empty() {
@@ -482,8 +733,289 @@ async fn post_chat(
     if text.len() > 8000 {
         return Ok(err(StatusCode::BAD_REQUEST, "message too long"));
     }
-    if db.create_message(org_id, user.id, text, now_secs()).await.is_err() {
+    if db.create_message(q.workspace_id, user.id, text, now_secs()).await.is_err() {
         return Ok(err(StatusCode::INTERNAL_SERVER_ERROR, "could not send message"));
     }
+    Ok(crypto::seal_reply(&epk, &json!({ "ok": true })))
+}
+
+/// Clear a workspace's group chat. Admin or root only.
+async fn clear_chat(user: User, db: Database, q: ChatQuery) -> Result<impl Reply, Rejection> {
+    ensure_ws(&db, &user, q.workspace_id).await?;
+    if user.role != "admin" && user.role != "root" {
+        return Err(warp::reject::custom(Forbidden));
+    }
+    let _ = db.clear_messages(q.workspace_id).await;
     Ok(warp::reply::json(&json!({ "ok": true })).into_response())
+}
+
+/// Resolve the org for a DM and verify the peer is a co-member. Returns the org.
+async fn dm_ctx(db: &Database, user: &User, q: &DmQuery) -> Result<i64, Rejection> {
+    let org = dm_org(user, q).ok_or_else(|| warp::reject::custom(Forbidden))?;
+    // The peer must belong to the same org; the actor must too (or be root).
+    let peer_ok = db.user_org(q.with).await.ok().flatten() == Some(org);
+    let self_ok = user.role == "root" || user.org_id == Some(org);
+    if peer_ok && self_ok {
+        Ok(org)
+    } else {
+        Err(warp::reject::custom(Forbidden))
+    }
+}
+
+async fn get_dm(
+    user: User,
+    db: Database,
+    q: DmQuery,
+    epk: Option<String>,
+) -> Result<impl Reply, Rejection> {
+    let org = dm_ctx(&db, &user, &q).await?;
+    let messages = db.list_dm(org, user.id, q.with, 300).await.unwrap_or_default();
+    let reactions = db.reactions_for_dm(org, user.id, q.with, user.id).await.unwrap_or_default();
+    let messages = attach_reactions(messages, reactions);
+    let typing = who_typing(&dm_scope(user.id, q.with), user.id, now_secs());
+    Ok(crypto::seal_reply(&epk, &json!({ "messages": messages, "typing": typing })))
+}
+
+async fn post_dm(
+    user: User,
+    db: Database,
+    q: DmQuery,
+    epk: Option<String>,
+    raw: bytes::Bytes,
+) -> Result<impl Reply, Rejection> {
+    let org = dm_ctx(&db, &user, &q).await?;
+    let body: ChatPost = match crypto::open_request(&epk, &raw)
+        .and_then(|b| serde_json::from_slice(&b).ok())
+    {
+        Some(v) => v,
+        None => return Ok(err(StatusCode::BAD_REQUEST, "bad payload")),
+    };
+    let text = body.body.trim();
+    if text.is_empty() {
+        return Ok(err(StatusCode::BAD_REQUEST, "empty message"));
+    }
+    if text.len() > 8000 {
+        return Ok(err(StatusCode::BAD_REQUEST, "message too long"));
+    }
+    if db.create_dm(org, user.id, q.with, text, now_secs()).await.is_err() {
+        return Ok(err(StatusCode::INTERNAL_SERVER_ERROR, "could not send message"));
+    }
+    Ok(crypto::seal_reply(&epk, &json!({ "ok": true })))
+}
+
+/// Clear a 1:1 conversation. Either participant may do this (clears for both).
+async fn clear_dm(user: User, db: Database, q: DmQuery) -> Result<impl Reply, Rejection> {
+    let org = dm_ctx(&db, &user, &q).await?;
+    let _ = db.clear_dm(org, user.id, q.with).await;
+    Ok(warp::reply::json(&json!({ "ok": true })).into_response())
+}
+
+/// Validate an edited body (shared by chat + DM edits).
+fn valid_edit(text: &str) -> Option<&str> {
+    let t = text.trim();
+    if t.is_empty() || t.len() > 8000 {
+        None
+    } else {
+        Some(t)
+    }
+}
+
+/// Edit one of your own group-chat messages. Author-scoped in the query, so
+/// there's no separate ownership check to get wrong.
+async fn edit_chat(
+    id: i64,
+    user: User,
+    db: Database,
+    epk: Option<String>,
+    raw: bytes::Bytes,
+) -> Result<impl Reply, Rejection> {
+    let body: EditBody = match crypto::open_request(&epk, &raw)
+        .and_then(|b| serde_json::from_slice(&b).ok())
+    {
+        Some(v) => v,
+        None => return Ok(err(StatusCode::BAD_REQUEST, "bad payload")),
+    };
+    let text = match valid_edit(&body.body) {
+        Some(t) => t,
+        None => return Ok(err(StatusCode::BAD_REQUEST, "empty or oversized message")),
+    };
+    match db.edit_message(id, user.id, text, now_secs()).await {
+        Ok(true) => Ok(crypto::seal_reply(&epk, &json!({ "ok": true }))),
+        _ => Ok(err(StatusCode::FORBIDDEN, "cannot edit this message")),
+    }
+}
+
+/// Delete one of your own group-chat messages.
+async fn delete_chat_msg(id: i64, user: User, db: Database) -> Result<impl Reply, Rejection> {
+    match db.delete_message(id, user.id).await {
+        Ok(true) => Ok(warp::reply::json(&json!({ "ok": true })).into_response()),
+        _ => Ok(err(StatusCode::FORBIDDEN, "cannot delete this message")),
+    }
+}
+
+/// Edit one of your own direct messages (sender-scoped).
+async fn edit_dm(
+    id: i64,
+    user: User,
+    db: Database,
+    epk: Option<String>,
+    raw: bytes::Bytes,
+) -> Result<impl Reply, Rejection> {
+    let body: EditBody = match crypto::open_request(&epk, &raw)
+        .and_then(|b| serde_json::from_slice(&b).ok())
+    {
+        Some(v) => v,
+        None => return Ok(err(StatusCode::BAD_REQUEST, "bad payload")),
+    };
+    let text = match valid_edit(&body.body) {
+        Some(t) => t,
+        None => return Ok(err(StatusCode::BAD_REQUEST, "empty or oversized message")),
+    };
+    match db.edit_dm(id, user.id, text, now_secs()).await {
+        Ok(true) => Ok(crypto::seal_reply(&epk, &json!({ "ok": true }))),
+        _ => Ok(err(StatusCode::FORBIDDEN, "cannot edit this message")),
+    }
+}
+
+/// Delete one of your own direct messages.
+async fn delete_dm_msg(id: i64, user: User, db: Database) -> Result<impl Reply, Rejection> {
+    match db.delete_dm_message(id, user.id).await {
+        Ok(true) => Ok(warp::reply::json(&json!({ "ok": true })).into_response()),
+        _ => Ok(err(StatusCode::FORBIDDEN, "cannot delete this message")),
+    }
+}
+
+/// "I'm typing" ping for a workspace's group chat (ephemeral, no body).
+async fn typing_chat(user: User, db: Database, q: ChatQuery) -> Result<impl Reply, Rejection> {
+    ensure_ws(&db, &user, q.workspace_id).await?;
+    mark_typing(format!("ws:{}", q.workspace_id), user.id, now_secs());
+    Ok(warp::reply::json(&json!({ "ok": true })).into_response())
+}
+
+/// "I'm typing" ping for a 1:1 conversation.
+async fn typing_dm(user: User, db: Database, q: DmQuery) -> Result<impl Reply, Rejection> {
+    let _ = dm_ctx(&db, &user, &q).await?;
+    mark_typing(dm_scope(user.id, q.with), user.id, now_secs());
+    Ok(warp::reply::json(&json!({ "ok": true })).into_response())
+}
+
+#[derive(Deserialize)]
+struct ReactBody {
+    kind: String,
+    msg_id: i64,
+    emoji: String,
+}
+
+/// Toggle an emoji reaction on a message. Reactions only ever surface through
+/// the thread-scoped join, so a reaction to an unseen id stays invisible —
+/// ponytail: no extra ownership/access check needed here.
+async fn toggle_reaction(
+    user: User,
+    db: Database,
+    epk: Option<String>,
+    raw: bytes::Bytes,
+) -> Result<impl Reply, Rejection> {
+    let body: ReactBody = match crypto::open_request(&epk, &raw)
+        .and_then(|b| serde_json::from_slice(&b).ok())
+    {
+        Some(v) => v,
+        None => return Ok(err(StatusCode::BAD_REQUEST, "bad payload")),
+    };
+    if body.kind != "ws" && body.kind != "dm" {
+        return Ok(err(StatusCode::BAD_REQUEST, "bad kind"));
+    }
+    let emoji = body.emoji.trim();
+    if emoji.is_empty() || emoji.chars().count() > 8 {
+        return Ok(err(StatusCode::BAD_REQUEST, "bad emoji"));
+    }
+    let _ = db.toggle_reaction(&body.kind, body.msg_id, user.id, emoji).await;
+    Ok(crypto::seal_reply(&epk, &json!({ "ok": true })))
+}
+
+/// Heartbeat: record that the caller is currently online.
+async fn presence_ping(user: User, db: Database) -> Result<impl Reply, Rejection> {
+    let _ = db.touch_last_seen(user.id, now_secs()).await;
+    Ok(warp::reply::json(&json!({ "ok": true })).into_response())
+}
+
+/// Who in the org is online / when they were last seen.
+async fn presence_get(user: User, db: Database, q: OrgQuery) -> Result<impl Reply, Rejection> {
+    let now = now_secs();
+    let list = match acting_org(&user, &q) {
+        Some(org) => db.org_presence(org).await.unwrap_or_default(),
+        None => Vec::new(),
+    };
+    let presence: Vec<_> = list
+        .into_iter()
+        .map(|(id, seen)| json!({ "id": id, "last_seen": seen, "online": now - seen < 45 }))
+        .collect();
+    Ok(warp::reply::json(&json!({ "presence": presence })).into_response())
+}
+
+/// Recent audit entries. Admins see their org; root sees every org.
+async fn audit_log(user: User, db: Database) -> Result<impl Reply, Rejection> {
+    if user.role != "admin" && user.role != "root" {
+        return Err(warp::reject::custom(Forbidden));
+    }
+    let all = user.role == "root";
+    let entries = db.list_audit(user.org_id, all, 300).await.unwrap_or_default();
+    Ok(warp::reply::json(&json!({ "entries": entries })).into_response())
+}
+
+/// Store an image pasted into chat; returns its id + URL.
+async fn upload_chat_image(
+    user: User,
+    db: Database,
+    q: OrgQuery,
+    mut form: FormData,
+) -> Result<impl Reply, Rejection> {
+    let org = match acting_org(&user, &q) {
+        Some(o) => o,
+        None => return Ok(err(StatusCode::FORBIDDEN, "no org")),
+    };
+    let mut found: Option<(Option<String>, Vec<u8>)> = None;
+    loop {
+        match form.try_next().await {
+            Ok(Some(part)) => {
+                if part.name() == "file" {
+                    let mime = part.content_type().map(|s| s.to_string());
+                    let bytes = match read_part(part).await {
+                        Ok(b) => b,
+                        Err(_) => return Ok(err(StatusCode::BAD_REQUEST, "could not read image")),
+                    };
+                    found = Some((mime, bytes));
+                    break;
+                }
+            }
+            Ok(None) => break,
+            Err(_) => return Ok(err(StatusCode::BAD_REQUEST, "invalid upload")),
+        }
+    }
+    let (mime, bytes) = match found {
+        Some(f) => f,
+        None => return Ok(err(StatusCode::BAD_REQUEST, "no file field")),
+    };
+    match db.create_chat_image(org, mime.as_deref(), &bytes, now_secs()).await {
+        Ok(id) => Ok(
+            warp::reply::json(&json!({ "id": id, "url": format!("/api/chat-image/{}", id) })).into_response(),
+        ),
+        Err(_) => Ok(err(StatusCode::INTERNAL_SERVER_ERROR, "could not store image")),
+    }
+}
+
+/// Serve a chat image to members of its org (root may view any).
+async fn get_chat_image(id: i64, user: User, db: Database) -> Result<impl Reply, Rejection> {
+    match db.get_chat_image(id).await.ok().flatten() {
+        Some((org, mime, data)) if user.role == "root" || Some(org) == user.org_id => {
+            let mime = mime.unwrap_or_else(|| "application/octet-stream".to_string());
+            let resp = warp::http::Response::builder()
+                .header("content-type", mime)
+                .header("cache-control", "private, max-age=86400")
+                .body(Body::from(data))
+                .expect("valid response");
+            Ok(resp)
+        }
+        Some(_) => Err(warp::reject::custom(Forbidden)),
+        None => Ok(err(StatusCode::NOT_FOUND, "no such image")),
+    }
 }

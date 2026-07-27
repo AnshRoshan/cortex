@@ -21,6 +21,10 @@ async fn main() {
     let seed_file = std::env::var("SEED_FILE").unwrap_or_else(|_| String::from("seed_users.json"));
     auth::seed_from_file(&database, &seed_file).await;
 
+    // Break-glass: set OWNER_2FA_RESET=1 on the host to clear the owner's 2FA if
+    // the authenticator device is ever lost. Only the owner controls the host.
+    auth::maybe_break_glass_owner_2fa(&database).await;
+
     let config = ServerConfig {
         expiry_days: std::env::var("EXPIRY_DAYS")
             .unwrap_or_else(|_| String::from("1"))
