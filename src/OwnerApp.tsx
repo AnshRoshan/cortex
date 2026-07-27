@@ -27,15 +27,17 @@ import {
 } from "@chakra-ui/react";
 import { FormEvent, ReactNode, useCallback, useEffect, useState } from "react";
 import { FiMoon, FiSun } from "react-icons/fi";
-import { VscKey, VscSignOut, VscTrash } from "react-icons/vsc";
+import { VscChromeClose, VscKey, VscSettingsGear, VscShield, VscSignOut, VscTrash } from "react-icons/vsc";
 
 import * as api from "./api";
 import { AdminOrg, AdminUser, Me } from "./api";
+import Settings from "./Settings";
 import WorkspaceApp from "./WorkspaceApp";
 
 // The hidden owner console. Full control over orgs + accounts, plus "Open" to
 // enter any org as the workspace app (owner has full cross-org edit access).
-function OwnerApp({ me, onLogout }: { me: Me; onLogout: () => void }) {
+function OwnerApp({ me, onLogout, onUpdated }: { me: Me; onLogout: () => void; onUpdated: () => void }) {
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const toast = useToast();
   const { colorMode, toggleColorMode } = useColorMode();
   const [orgs, setOrgs] = useState<AdminOrg[]>([]);
@@ -64,6 +66,18 @@ function OwnerApp({ me, onLogout }: { me: Me; onLogout: () => void }) {
     api.adminListUsers().then((r) => setUsers(r.users)).catch(() => {});
   }, []);
   useEffect(load, [load]);
+
+  // Ctrl/Cmd+, opens Settings, like VS Code.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.key === ",") {
+        e.preventDefault();
+        setSettingsOpen(true);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
 
   async function run(fn: () => Promise<unknown>, ok?: string) {
     try {
@@ -100,13 +114,47 @@ function OwnerApp({ me, onLogout }: { me: Me; onLogout: () => void }) {
               onClick={toggleColorMode}
             />
           </Tooltip>
+          <Tooltip label={settingsOpen ? "Close settings" : "Account & security"}>
+            <IconButton
+              aria-label="Account & security"
+              icon={settingsOpen ? <VscChromeClose /> : <VscSettingsGear />}
+              variant="ghost"
+              color={settingsOpen ? "ink.base" : "ink.muted"}
+              onClick={() => setSettingsOpen((v) => !v)}
+            />
+          </Tooltip>
           <Tooltip label="Sign out">
             <IconButton aria-label="Sign out" icon={<VscSignOut />} variant="ghost" color="ink.muted" onClick={onLogout} />
           </Tooltip>
         </HStack>
       </Flex>
 
-      <Box flex={1} overflowY="auto" p={{ base: 5, md: 8 }}>
+      {!me.mfa && (
+        <Flex
+          align="center"
+          gap={3}
+          px={6}
+          py={3}
+          bg="orange.400"
+          color="black"
+          fontSize="sm"
+        >
+          <VscShield />
+          <Text flex={1}>
+            <b>This is the owner account — the master key.</b> Protect it with an authenticator app before anything
+            else.
+          </Text>
+          <Button size="xs" colorScheme="blackAlpha" onClick={() => setSettingsOpen(true)}>
+            Enable two-factor
+          </Button>
+        </Flex>
+      )}
+
+      {settingsOpen && (
+        <Settings me={me} onClose={() => setSettingsOpen(false)} onUpdated={onUpdated} />
+      )}
+
+      <Box flex={1} overflowY="auto" p={{ base: 5, md: 8 }} display={settingsOpen ? "none" : "block"}>
         <Box maxW="880px" mx="auto">
           <Tabs colorScheme="brand" isLazy>
             <TabList mb={6} borderColor={border}>
@@ -312,6 +360,19 @@ function OwnerApp({ me, onLogout }: { me: Me; onLogout: () => void }) {
                                 }}
                               />
                             </Tooltip>
+                            <Tooltip label="Reset two-factor (lost device)">
+                              <IconButton
+                                aria-label="Reset two-factor"
+                                icon={<VscShield />}
+                                size="xs"
+                                variant="ghost"
+                                color="ink.muted"
+                                onClick={() => {
+                                  if (confirm(`Reset two-factor for ${u.email}? They'll set it up again on next login.`))
+                                    run(() => api.adminReset2fa(u.id), "Two-factor reset");
+                                }}
+                              />
+                            </Tooltip>
                             <Tooltip label="Delete account">
                               <IconButton
                                 aria-label="Delete account"
@@ -335,6 +396,7 @@ function OwnerApp({ me, onLogout }: { me: Me; onLogout: () => void }) {
           </Tabs>
         </Box>
       </Box>
+
     </Flex>
   );
 }

@@ -9,7 +9,7 @@ import {
   Text,
   useToast,
 } from "@chakra-ui/react";
-import { useRef } from "react";
+import { useRef, useState } from "react";
 import {
   VscCloudUpload,
   VscDesktopDownload,
@@ -20,6 +20,7 @@ import {
 
 import * as api from "./api";
 import { FileRow } from "./api";
+import { ConfirmModal } from "./Dialogs";
 
 type Props = {
   files: FileRow[];
@@ -38,6 +39,7 @@ function iconFor(mime: string | null) {
 function DocumentsView({ files, workspaceId, canManage, onOpenFile, onChanged }: Props) {
   const toast = useToast();
   const fileInput = useRef<HTMLInputElement>(null);
+  const [pendingDelete, setPendingDelete] = useState<FileRow | null>(null);
   const isOwner = canManage;
   const docs = files.filter((f) => f.kind === "binary");
 
@@ -172,11 +174,7 @@ function DocumentsView({ files, workspaceId, canManage, onOpenFile, onChanged }:
                       leftIcon={<VscTrash />}
                       colorScheme="red"
                       variant="outline"
-                      onClick={() => {
-                        if (confirm(`Delete ${f.path}?`)) {
-                          api.deleteFile(f.id).then(onChanged).catch(fail);
-                        }
-                      }}
+                      onClick={() => setPendingDelete(f)}
                     >
                       Delete
                     </Button>
@@ -187,6 +185,16 @@ function DocumentsView({ files, workspaceId, canManage, onOpenFile, onChanged }:
           </SimpleGrid>
         )}
       </Box>
+
+      <ConfirmModal
+        isOpen={!!pendingDelete}
+        title="Delete document"
+        body={pendingDelete ? `Delete ${pendingDelete.path}? This can't be undone.` : ""}
+        onConfirm={() => {
+          if (pendingDelete) api.deleteFile(pendingDelete.id).then(onChanged).catch(fail);
+        }}
+        onClose={() => setPendingDelete(null)}
+      />
     </Box>
   );
 }

@@ -1,0 +1,46 @@
+import { Flex, IconButton, IconButtonProps, Text } from "@chakra-ui/react";
+import { ReactNode } from "react";
+
+// Shared workbench chrome primitives, so panel headers and their actions are
+// sized and spaced consistently everywhere (one design system, not one-offs).
+
+/** A compact ghost icon button used in panel headers (VS Code-sized: 22px). */
+export function PanelIconButton(props: IconButtonProps) {
+  return (
+    <IconButton
+      variant="ghost"
+      minW="22px"
+      h="22px"
+      boxSize="22px"
+      borderRadius="4px"
+      color="ink.muted"
+      fontSize="16px"
+      _hover={{ bg: "surface.hover", color: "ink.base" }}
+      _active={{ bg: "surface.hover" }}
+      {...props}
+    />
+  );
+}
+
+/** A panel section header: fixed height, uppercase label, right-aligned actions. */
+export function PanelHeader({ title, actions }: { title: string; actions?: ReactNode }) {
+  return (
+    <Flex align="center" justify="space-between" h="35px" pl={4} pr={2} flexShrink={0}>
+      <Text
+        fontSize="11px"
+        fontWeight={700}
+        textTransform="uppercase"
+        letterSpacing="0.05em"
+        color="ink.subtle"
+        isTruncated
+      >
+        {title}
+      </Text>
+      {actions && (
+        <Flex align="center" gap="1px">
+          {actions}
+        </Flex>
+      )}
+    </Flex>
+  );
+}

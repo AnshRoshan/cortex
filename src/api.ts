@@ -1,7 +1,8 @@
 // Typed client for the AuthPad backend. Same-origin; relies on the HttpOnly
 // session cookie set at login.
+import { encFetch } from "./crypto";
 
-export type Me = { email: string; name: string; role: string };
+export type Me = { email: string; name: string; role: string; mfa: boolean };
 export type Org = { id: number; name: string; slug: string };
 export type Workspace = { id: number; org_id: number; name: string; slug: string };
 export type FileRow = {
@@ -13,13 +14,18 @@ export type FileRow = {
   mime: string | null;
 };
 export type Member = { id: number; email: string; name: string; role: string };
+export type Reaction = { emoji: string; count: number; mine: boolean };
 export type ChatMessage = {
   id: number;
   body: string;
   author: string;
   email: string;
   created_at: number;
+  edited_at?: number | null;
+  reactions?: Reaction[];
 };
+export type Presence = { id: number; last_seen: number; online: boolean };
+type ChatThread = { messages: ChatMessage[]; typing?: number[] };
 export type OrgData = {
   org: Org | null;
   workspaces: Workspace[];
@@ -83,6 +89,20 @@ export async function changePassword(current: string, newPassword: string): Prom
   await json(await fetch("/api/profile/password", opts("POST", { current, new: newPassword })));
 }
 
+// ----- two-factor (TOTP / authenticator app) -----
+export async function setup2fa(): Promise<{ secret: string; otpauth_url: string }> {
+  return json(await fetch("/api/2fa/setup", opts("POST")));
+}
+export async function enable2fa(code: string): Promise<void> {
+  await json(await fetch("/api/2fa/enable", opts("POST", { code })));
+}
+export async function disable2fa(password: string): Promise<void> {
+  await json(await fetch("/api/2fa/disable", opts("POST", { password })));
+}
+export async function adminReset2fa(id: number): Promise<void> {
+  await json(await fetch(`/api/admin/users/${id}/2fa/reset`, opts("POST")));
+}
+
 // ----- org / workspaces -----
 export async function getOrg(orgId?: number): Promise<OrgData> {
   return json(await fetch(`/api/org${orgQ(orgId)}`, { credentials: "include" }));
@@ -139,12 +159,83 @@ export async function moveFile(id: number, path: string): Promise<void> {
   await json(await fetch(`/api/files/${id}`, opts("PUT", { path })));
 }
 
-// ----- chat (org-wide) -----
-export async function getChat(orgId?: number): Promise<{ messages: ChatMessage[] }> {
-  return json(await fetch(`/api/chat${orgQ(orgId)}`, { credentials: "include" }));
+// ----- workspace group chat (payloads encrypted end-to-end with the server) -----
+export async function getWorkspaceChat(workspaceId: number): Promise<ChatThread> {
+  return encFetch(`/api/chat?workspace_id=${workspaceId}`);
 }
-export async function postChat(body: string, orgId?: number): Promise<void> {
-  await json(await fetch(`/api/chat${orgQ(orgId)}`, opts("POST", { body })));
+export async function postWorkspaceChat(workspaceId: number, body: string): Promise<void> {
+  await encFetch(`/api/chat?workspace_id=${workspaceId}`, { method: "POST", body: { body } });
+}
+export async function clearWorkspaceChat(workspaceId: number): Promise<void> {
+  await json(await fetch(`/api/chat?workspace_id=${workspaceId}`, opts("DELETE")));
+}
+// Edit / delete your own message (author-scoped on the server).
+export async function editWorkspaceChat(id: number, body: string): Promise<void> {
+  await encFetch(`/api/chat/${id}`, { method: "PATCH", body: { body } });
+}
+export async function deleteWorkspaceChatMsg(id: number): Promise<void> {
+  await json(await fetch(`/api/chat/${id}`, opts("DELETE")));
+}
+
+// ----- direct messages (org-wide, 1:1; payloads encrypted) -----
+function dmQ(withId: number, orgId?: number) {
+  return `/api/dm?with=${withId}${orgId != null ? `&org=${orgId}` : ""}`;
+}
+export async function getDm(withId: number, orgId?: number): Promise<ChatThread> {
+  return encFetch(dmQ(withId, orgId));
+}
+export async function postDm(withId: number, body: string, orgId?: number): Promise<void> {
+  await encFetch(dmQ(withId, orgId), { method: "POST", body: { body } });
+}
+export async function clearDm(withId: number, orgId?: number): Promise<void> {
+  await json(await fetch(dmQ(withId, orgId), opts("DELETE")));
+}
+export async function editDm(id: number, body: string): Promise<void> {
+  await encFetch(`/api/dm/${id}`, { method: "PATCH", body: { body } });
+}
+export async function deleteDmMsg(id: number): Promise<void> {
+  await json(await fetch(`/api/dm/${id}`, opts("DELETE")));
+}
+
+// ----- presence, typing, reactions -----
+export async function getPresence(orgId?: number): Promise<{ presence: Presence[] }> {
+  return json(await fetch(`/api/presence${orgQ(orgId)}`, { credentials: "include" }));
+}
+// Heartbeat / typing pings are best-effort — never surface their errors.
+export async function pingPresence(): Promise<void> {
+  try { await fetch("/api/presence", opts("POST")); } catch { /* ignore */ }
+}
+export async function pingTypingWs(workspaceId: number): Promise<void> {
+  try { await fetch(`/api/chat/typing?workspace_id=${workspaceId}`, opts("POST")); } catch { /* ignore */ }
+}
+export async function pingTypingDm(withId: number, orgId?: number): Promise<void> {
+  try { await fetch(`/api/dm/typing?with=${withId}${orgId != null ? `&org=${orgId}` : ""}`, opts("POST")); } catch { /* ignore */ }
+}
+export async function toggleReaction(kind: "ws" | "dm", msgId: number, emoji: string): Promise<void> {
+  await encFetch(`/api/reaction`, { method: "POST", body: { kind, msg_id: msgId, emoji } });
+}
+
+// ----- audit log (admin / root only) -----
+export type AuditEntry = {
+  id: number;
+  action: string;
+  detail: string | null;
+  email: string;
+  name: string;
+  created_at: number;
+};
+export async function getAudit(): Promise<{ entries: AuditEntry[] }> {
+  return json(await fetch("/api/audit", { credentials: "include" }));
+}
+
+// Images pasted into chat: stored org-scoped, separate from workspace files.
+export async function uploadChatImage(file: File, orgId?: number): Promise<{ id: number; url: string }> {
+  const fd = new FormData();
+  fd.append("file", file);
+  const q = orgId != null ? `?org=${orgId}` : "";
+  return json(
+    await fetch(`/api/chat-image${q}`, { method: "POST", credentials: "include", body: fd }),
+  );
 }
 
 // ----- root owner: users -----

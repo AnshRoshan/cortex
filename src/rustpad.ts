@@ -6,6 +6,8 @@ import type {
 } from "monaco-editor/esm/vs/editor/editor.api";
 import { OpSeq } from "rustpad-wasm";
 
+import { getSession, wsOpen, wsSeal } from "./crypto";
+
 /** Options passed in to the Rustpad constructor. */
 export type RustpadOptions = {
   readonly uri: string;
@@ -36,6 +38,13 @@ class Rustpad {
   private readonly beforeUnload: (event: BeforeUnloadEvent) => void;
   private readonly tryConnectId: number;
   private readonly resetFailuresId: number;
+
+  // Payload encryption for the socket (proxy-opaque; same key as chat).
+  private crypto?: { epk: string; key: CryptoKey };
+  private sendQueue: string[] = [];
+  private draining: boolean = false;
+  private recvQueue: string[] = [];
+  private recvDraining: boolean = false;
 
   // Client-server state
   private me: number = -1;
@@ -98,7 +107,7 @@ class Rustpad {
 
   /** Try to set the language of the editor, if connected. */
   setLanguage(language: string): boolean {
-    this.ws?.send(`{"SetLanguage":${JSON.stringify(language)}}`);
+    this.enqueueSend(`{"SetLanguage":${JSON.stringify(language)}}`);
     return this.ws !== undefined;
   }
 
@@ -123,9 +132,18 @@ class Rustpad {
     if (this.connecting || this.ws) return;
     this.connecting = true;
     const ws = new WebSocket(this.options.uri);
-    ws.onopen = () => {
+    ws.onopen = async () => {
+      // Establish the shared key, then send our public key as the first frame
+      // (plaintext); everything after this is encrypted.
+      try {
+        this.crypto = await getSession();
+      } catch {
+        ws.close();
+        return;
+      }
       this.connecting = false;
       this.ws = ws;
+      ws.send(JSON.stringify({ epk: this.crypto.epk }));
       this.options.onConnected?.();
       this.users = {};
       this.options.onChangeUsers?.(this.users);
@@ -138,6 +156,7 @@ class Rustpad {
     ws.onclose = () => {
       if (this.ws) {
         this.ws = undefined;
+        this.sendQueue = [];
         this.options.onDisconnected?.();
         if (++this.recentFailures >= 5) {
           // If we disconnect 5 times within 15 reconnection intervals, then the
@@ -151,9 +170,54 @@ class Rustpad {
     };
     ws.onmessage = ({ data }) => {
       if (typeof data === "string") {
-        this.handleMessage(JSON.parse(data));
+        this.enqueueRecv(data);
       }
     };
+  }
+
+  // Outgoing frames are encrypted; a single drain loop keeps them in order
+  // (Web Crypto is async, so we can't just seal-and-send inline).
+  private enqueueSend(msg: string) {
+    if (!this.ws || !this.crypto) return;
+    this.sendQueue.push(msg);
+    void this.drainSend();
+  }
+
+  private async drainSend() {
+    if (this.draining) return;
+    this.draining = true;
+    while (this.sendQueue.length > 0 && this.ws && this.crypto) {
+      const msg = this.sendQueue.shift()!;
+      try {
+        const env = await wsSeal(this.crypto.key, msg);
+        this.ws?.send(JSON.stringify(env));
+      } catch {
+        /* drop; the OT layer resends outstanding ops on reconnect */
+      }
+    }
+    this.draining = false;
+  }
+
+  // Incoming frames are decrypted in order before hitting the OT handler.
+  private enqueueRecv(data: string) {
+    this.recvQueue.push(data);
+    void this.drainRecv();
+  }
+
+  private async drainRecv() {
+    if (this.recvDraining) return;
+    this.recvDraining = true;
+    while (this.recvQueue.length > 0) {
+      const raw = this.recvQueue.shift()!;
+      if (!this.crypto) continue;
+      try {
+        const text = await wsOpen(this.crypto.key, JSON.parse(raw));
+        this.handleMessage(JSON.parse(text));
+      } catch {
+        /* ignore an undecryptable / malformed frame */
+      }
+    }
+    this.recvDraining = false;
   }
 
   private handleMessage(msg: ServerMsg) {
@@ -240,18 +304,18 @@ class Rustpad {
 
   private sendOperation(operation: OpSeq) {
     const op = operation.to_string();
-    this.ws?.send(`{"Edit":{"revision":${this.revision},"operation":${op}}}`);
+    this.enqueueSend(`{"Edit":{"revision":${this.revision},"operation":${op}}}`);
   }
 
   private sendInfo() {
     if (this.myInfo) {
-      this.ws?.send(`{"ClientInfo":${JSON.stringify(this.myInfo)}}`);
+      this.enqueueSend(`{"ClientInfo":${JSON.stringify(this.myInfo)}}`);
     }
   }
 
   private sendCursorData() {
     if (!this.buffer) {
-      this.ws?.send(`{"CursorData":${JSON.stringify(this.cursorData)}}`);
+      this.enqueueSend(`{"CursorData":${JSON.stringify(this.cursorData)}}`);
     }
   }
 
@@ -340,6 +404,8 @@ class Rustpad {
           decorations.push({
             options: {
               className: `remote-cursor-${hue}`,
+              // Always-on floating name tag at the caret (not just on hover).
+              after: { content: name, inlineClassName: `remote-cursor-label-${hue}` },
               stickiness: 1,
               zIndex: 2,
             },
@@ -495,6 +561,21 @@ function generateCssStyles(hue: number) {
       }
       .monaco-editor .remote-cursor-${hue} {
         border-left: 2px solid hsl(${hue}, 90%, 25%);
+      }
+      .monaco-editor .remote-cursor-label-${hue} {
+        /* Float the name above the caret, out of the text flow so it never
+           shifts the document. ponytail: absolute+translateY, good enough. */
+        position: absolute;
+        transform: translateY(-100%);
+        background-color: hsl(${hue}, 90%, 25%);
+        color: #fff;
+        font-size: 10px;
+        line-height: 1.4;
+        padding: 0 4px;
+        border-radius: 3px 3px 3px 0;
+        white-space: nowrap;
+        pointer-events: none;
+        z-index: 3;
       }
     `;
     const element = document.createElement("style");

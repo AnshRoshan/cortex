@@ -19,18 +19,30 @@ function App() {
     });
   }, []);
 
+  // Presence heartbeat while signed in, so teammates see us as online.
+  useEffect(() => {
+    if (!me) return;
+    api.pingPresence();
+    const id = window.setInterval(() => api.pingPresence(), 25000);
+    return () => window.clearInterval(id);
+  }, [me]);
+
   async function handleLogout() {
     await api.logout();
     window.location.reload();
   }
 
+  const refresh = () => {
+    api.getMe().then((m) => m && setMe(m));
+  };
+
   if (!me) return <Loader />;
 
   // Root → hidden owner console; everyone else → their org's workspace app.
   return me.role === "root" ? (
-    <OwnerApp me={me} onLogout={handleLogout} />
+    <OwnerApp me={me} onLogout={handleLogout} onUpdated={refresh} />
   ) : (
-    <WorkspaceApp me={me} onLogout={handleLogout} />
+    <WorkspaceApp me={me} onLogout={handleLogout} onUpdated={refresh} />
   );
 }
 
