@@ -489,6 +489,9 @@ function EditorGroup({
   const [view, setView] = useState<"editor" | "preview">("editor");
   const [previewPos, setPreviewPos] = useState(0);
   const [mdText, setMdText] = useState("");
+  // Holds the current preview-toggle closure so the Monaco keybinding (bound
+  // once at mount) always calls the up-to-date version.
+  const previewToggleRef = useRef<() => void>(() => {});
 
   const stateRef = useRef({ openFiles, activeFileId, onSelectTab, onCloseTab });
   stateRef.current = { openFiles, activeFileId, onSelectTab, onCloseTab };
@@ -520,6 +523,7 @@ function EditorGroup({
     ed.addCommand(KeyMod.CtrlCmd | KeyMod.Shift | KeyCode.KeyP, () => {
       ed.trigger("keyboard", "editor.action.quickCommand", {});
     });
+    ed.addCommand(KeyMod.CtrlCmd | KeyMod.Shift | KeyCode.KeyV, () => previewToggleRef.current());
     ed.addCommand(KeyMod.Alt | KeyCode.KeyZ, () => {
       const wordWrap = !prefsRef.current.wordWrap;
       setPrefs({ ...prefsRef.current, wordWrap });
@@ -565,6 +569,18 @@ function EditorGroup({
   const previewTab = preview && previewable; // the tab is present
   const previewActive = previewTab && view === "preview"; // and currently shown
   const slot = Math.min(previewPos, openFiles.length);
+
+  // Keep the Ctrl+Shift+V toggle in sync with current state (see previewToggleRef).
+  previewToggleRef.current = () => {
+    if (!previewable) return;
+    if (previewActive) {
+      setView("editor");
+      return;
+    }
+    if (!preview) setPreviewPos(openFiles.length);
+    setPreview(true);
+    setView("preview");
+  };
 
   useEffect(() => {
     setLangOverride(null);

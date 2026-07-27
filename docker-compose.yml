@@ -11,6 +11,14 @@ services:
     environment:
       RUST_LOG: info
       EXPIRY_DAYS: "1"
+      # AI assistant (optional): export these before `docker compose up`.
+      # AI_KEY_SECRET enables storing per-user/org keys in the UI (encrypts them).
+      AI_KEY_SECRET: "${AI_KEY_SECRET:-}"
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+      AI_MODEL: "${AI_MODEL:-claude-opus-5}"
+      # Seed users can live entirely in .env (SEED_USERS, raw JSON). If empty,
+      # the mounted seed_users.json below is used instead.
+      SEED_USERS: "${SEED_USERS:-}"
       # SQLITE_URI and SEED_FILE are set in the image; overridable here.
     volumes:
       # Persist the SQLite database (users, sessions, workspaces, files).

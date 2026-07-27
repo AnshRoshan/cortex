@@ -11,6 +11,18 @@ use anyhow::{bail, Result};
 use serde::Serialize;
 use sqlx::{sqlite::SqliteConnectOptions, ConnectOptions, SqlitePool};
 
+/// A stored AI provider config. `key_cipher` is the encrypted API key.
+#[derive(sqlx::FromRow, Clone, Debug)]
+pub struct ProviderRow {
+    pub scope: String,
+    pub scope_id: i64,
+    pub provider: String,
+    pub base_url: Option<String>,
+    pub model: String,
+    pub key_cipher: String,
+    pub updated_at: i64,
+}
+
 /// Represents a document persisted in database storage.
 #[derive(sqlx::FromRow, PartialEq, Eq, Clone, Debug)]
 pub struct PersistedDocument {
@@ -313,6 +325,26 @@ impl Database {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    /// Change a user's login username (the `email` column). Returns Ok(false) if
+    /// the username is already taken by someone else (the column is UNIQUE).
+    pub async fn update_email(&self, user_id: i64, email: &str) -> Result<bool> {
+        let taken: Option<(i64,)> =
+            sqlx::query_as(r#"SELECT id FROM users WHERE email = $1 AND id <> $2"#)
+                .bind(email)
+                .bind(user_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        if taken.is_some() {
+            return Ok(false);
+        }
+        sqlx::query(r#"UPDATE users SET email = $1 WHERE id = $2"#)
+            .bind(email)
+            .bind(user_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(true)
     }
 
     /// Update a user's password hash.
@@ -811,6 +843,100 @@ impl Database {
         }
         tx.commit().await?;
         Ok(())
+    }
+
+    // ----- AI provider config (keys stored encrypted; see crypto::secret_*) -----
+
+    /// The provider config for a scope, if any. `key_cipher` is the encrypted key.
+    pub async fn get_provider(&self, scope: &str, scope_id: i64) -> Result<Option<ProviderRow>> {
+        Ok(sqlx::query_as(
+            r#"SELECT scope, scope_id, provider, base_url, model, key_cipher, updated_at
+               FROM ai_provider WHERE scope = $1 AND scope_id = $2"#,
+        )
+        .bind(scope)
+        .bind(scope_id)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    /// Create or replace a scope's provider config.
+    pub async fn upsert_provider(
+        &self,
+        scope: &str,
+        scope_id: i64,
+        provider: &str,
+        base_url: Option<&str>,
+        model: &str,
+        key_cipher: &str,
+        now: i64,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"INSERT INTO ai_provider (scope, scope_id, provider, base_url, model, key_cipher, updated_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7)
+               ON CONFLICT(scope, scope_id) DO UPDATE SET
+                 provider = excluded.provider, base_url = excluded.base_url,
+                 model = excluded.model, key_cipher = excluded.key_cipher,
+                 updated_at = excluded.updated_at"#,
+        )
+        .bind(scope)
+        .bind(scope_id)
+        .bind(provider)
+        .bind(base_url)
+        .bind(model)
+        .bind(key_cipher)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn delete_provider(&self, scope: &str, scope_id: i64) -> Result<()> {
+        sqlx::query(r#"DELETE FROM ai_provider WHERE scope = $1 AND scope_id = $2"#)
+            .bind(scope)
+            .bind(scope_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// (user_id, provider, model) for every user in an org who set a personal
+    /// config — for the owner/admin overview (no keys).
+    pub async fn org_user_providers(&self, org_id: i64) -> Result<Vec<(i64, String, String)>> {
+        Ok(sqlx::query_as(
+            r#"SELECT p.scope_id, p.provider, p.model
+               FROM ai_provider p JOIN users u ON u.id = p.scope_id
+               WHERE p.scope = 'user' AND u.org_id = $1"#,
+        )
+        .bind(org_id)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    // ----- Storage stats (owner console) -----
+
+    /// Total database file size in bytes (page_count * page_size).
+    pub async fn db_size_bytes(&self) -> Result<i64> {
+        let (pages,): (i64,) = sqlx::query_as("PRAGMA page_count").fetch_one(&self.pool).await?;
+        let (size,): (i64,) = sqlx::query_as("PRAGMA page_size").fetch_one(&self.pool).await?;
+        Ok(pages * size)
+    }
+
+    /// Row count for a single table (table name is a fixed constant, never user input).
+    pub async fn table_rows(&self, table: &str) -> Result<i64> {
+        let sql = format!("SELECT COUNT(*) FROM {}", table);
+        let (n,): (i64,) = sqlx::query_as(&sql).fetch_one(&self.pool).await?;
+        Ok(n)
+    }
+
+    /// Total bytes stored in binary blobs (uploaded files + pasted chat images).
+    pub async fn blob_bytes(&self) -> Result<i64> {
+        let (a,): (i64,) = sqlx::query_as("SELECT COALESCE(SUM(LENGTH(data)),0) FROM file_blob")
+            .fetch_one(&self.pool)
+            .await?;
+        let (b,): (i64,) = sqlx::query_as("SELECT COALESCE(SUM(LENGTH(data)),0) FROM chat_image")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(a + b)
     }
 
     // ----- Workspace group chat -----

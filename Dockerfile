@@ -11,11 +11,10 @@ COPY rustpad-wasm rustpad-wasm
 # is compilation, not downloads). We deliberately do NOT cache the cargo registry:
 # the corp network truncates crates.io downloads and a cache mount would persist a
 # corrupt crate. target/ is a cache mount (not in the image), so copy the binary
-# out in the same RUN. Only the library unit tests run — the tests/ integration
-# suite predates authentication.
+# out in the same RUN. No tests here — deploy builds ship the binary; run
+# `cargo test` locally / in CI, not on the prod box.
 RUN --mount=type=cache,target=/home/rust/src/target \
-    cargo test --release --lib \
-    && cargo build --release \
+    cargo build --release \
     && cp target/release/rustpad-server /rustpad-server
 
 FROM --platform=amd64 rust:alpine AS wasm

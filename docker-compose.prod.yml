@@ -10,6 +10,15 @@ services:
       - SEED_FILE=/seed/seed_users.json
       - COOKIE_SECURE=1
       - RUST_LOG=info
+      # AI assistant: optional. Set ANTHROPIC_API_KEY in the host environment (or a
+      # .env file next to this compose file) to enable it; unset = feature hidden.
+      # AI_MODEL defaults to claude-opus-5; override for cost (e.g. claude-haiku-4-5).
+      # AI_KEY_SECRET enables storing per-user/org keys in the UI (encrypts them).
+      - AI_KEY_SECRET=${AI_KEY_SECRET:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - AI_MODEL=${AI_MODEL:-claude-opus-5}
+      # Optional: put seed users in .env as SEED_USERS (raw JSON) instead of the file.
+      - SEED_USERS=${SEED_USERS:-}
     volumes:
       - cortex-data:/data
       # Mounted in its own dir (not under /data) so it doesn't collide with the

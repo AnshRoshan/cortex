@@ -281,7 +281,7 @@ function OwnerApp({ me, onLogout, onUpdated }: { me: Me; onLogout: () => void; o
                 >
                   <VStack spacing={3} align="stretch">
                     <HStack spacing={3} flexWrap="wrap">
-                      <Input flex="1 1 200px" size="sm" type="email" placeholder="email@company.com" value={email} onChange={(e) => setEmail(e.target.value)} isRequired />
+                      <Input flex="1 1 200px" size="sm" placeholder="username" value={email} onChange={(e) => setEmail(e.target.value)} isRequired />
                       <Input flex="1 1 140px" size="sm" placeholder="Display name" value={uname} onChange={(e) => setUname(e.target.value)} />
                     </HStack>
                     <HStack spacing={3} flexWrap="wrap">
@@ -309,7 +309,7 @@ function OwnerApp({ me, onLogout, onUpdated }: { me: Me; onLogout: () => void; o
                 <TableCard border={border} empty={users.length === 0} emptyText="No accounts yet.">
                   <Thead>
                     <Tr>
-                      <Th borderColor={border} color="ink.subtle">Email</Th>
+                      <Th borderColor={border} color="ink.subtle">Username</Th>
                       <Th borderColor={border} color="ink.subtle">Name</Th>
                       <Th borderColor={border} color="ink.subtle">Role</Th>
                       <Th borderColor={border} color="ink.subtle">Org</Th>

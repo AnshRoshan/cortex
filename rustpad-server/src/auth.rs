@@ -129,18 +129,35 @@ fn default_role() -> String {
 /// an existing account.
 // ponytail: seed-on-startup from a file; matches the "DB-seeding only" rule
 // without a separate CLI. Upgrade path: a `seed` subcommand if rotation matters.
-pub async fn seed_from_file(db: &Database, path: &str) {
-    let contents = match std::fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(_) => {
-            warn!("no seed file at {path:?}; no users will be created this run");
+/// Seed users from the `SEED_USERS` env var (raw JSON array) if set, otherwise
+/// from the `SEED_FILE` JSON file. Env wins so everything can live in one .env.
+pub async fn seed_users(db: &Database) {
+    if let Ok(json) = std::env::var("SEED_USERS") {
+        if !json.trim().is_empty() {
+            seed_from_json(db, &json, "SEED_USERS env").await;
             return;
         }
-    };
-    let users: Vec<SeedUser> = match serde_json::from_str(&contents) {
+    }
+    let path = std::env::var("SEED_FILE").unwrap_or_else(|_| String::from("seed_users.json"));
+    match std::fs::read_to_string(&path) {
+        Ok(contents) => seed_from_json(db, &contents, &format!("seed file {path:?}")).await,
+        Err(_) => warn!("no SEED_USERS env and no seed file at {path:?}; no users created this run"),
+    }
+}
+
+pub async fn seed_from_file(db: &Database, path: &str) {
+    match std::fs::read_to_string(path) {
+        Ok(contents) => seed_from_json(db, &contents, &format!("seed file {path:?}")).await,
+        Err(_) => warn!("no seed file at {path:?}; no users will be created this run"),
+    }
+}
+
+/// Parse a JSON array of seed users and create any that don't already exist.
+async fn seed_from_json(db: &Database, json: &str, source: &str) {
+    let users: Vec<SeedUser> = match serde_json::from_str(json) {
         Ok(u) => u,
         Err(e) => {
-            warn!("could not parse seed file {path:?}: {e}");
+            warn!("could not parse {source}: {e}");
             return;
         }
     };

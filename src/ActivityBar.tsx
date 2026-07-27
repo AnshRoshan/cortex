@@ -22,11 +22,12 @@ import {
   VscGear,
   VscSignOut,
   VscSourceControl,
+  VscSparkle,
 } from "react-icons/vsc";
 
 import { Me } from "./api";
 
-export type Section = "explorer" | "scm" | "chat";
+export type Section = "explorer" | "scm" | "chat" | "assistant";
 
 type Item = { key: Section; icon: ElementType; label: string; count?: number };
 
@@ -59,6 +60,7 @@ function ActivityBar({
     { key: "explorer", icon: VscFiles, label: "Explorer" },
     { key: "scm", icon: VscSourceControl, label: "Source Control", count: changeCount },
     { key: "chat", icon: VscComment, label: "Chat", count: chatCount },
+    { key: "assistant", icon: VscSparkle, label: "Assistant" },
   ];
 
   return (

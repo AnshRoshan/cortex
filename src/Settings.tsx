@@ -11,6 +11,7 @@ import {
   Image,
   Input,
   Kbd,
+  Select,
   SimpleGrid,
   Switch,
   Text,
@@ -19,16 +20,16 @@ import {
   VStack,
 } from "@chakra-ui/react";
 import QRCode from "qrcode";
-import { FormEvent, ReactNode, useEffect, useState } from "react";
+import { FormEvent, ReactNode, useCallback, useEffect, useState } from "react";
 import { FiCommand, FiSliders } from "react-icons/fi";
-import { VscAccount, VscColorMode, VscHistory, VscShield } from "react-icons/vsc";
+import { VscAccount, VscColorMode, VscDatabase, VscHistory, VscShield, VscSparkle } from "react-icons/vsc";
 
 import * as api from "./api";
 import { Me } from "./api";
 import { EditorPrefs, useEditorPrefs } from "./editorPrefs";
 import { EDITOR_THEMES, SWATCHES, useEditorThemeId } from "./editorThemes";
 
-type Section = "profile" | "appearance" | "editor" | "keyboard" | "security" | "activity";
+type Section = "profile" | "appearance" | "editor" | "keyboard" | "security" | "ai" | "activity" | "storage";
 
 type Props = {
   me: Me | null;
@@ -42,7 +43,9 @@ const NAV: { id: Section; label: string; icon: typeof VscAccount; adminOnly?: bo
   { id: "editor", label: "Editor", icon: FiSliders },
   { id: "keyboard", label: "Keyboard", icon: FiCommand },
   { id: "security", label: "Security", icon: VscShield },
+  { id: "ai", label: "AI", icon: VscSparkle },
   { id: "activity", label: "Activity", icon: VscHistory, adminOnly: true },
+  { id: "storage", label: "Storage", icon: VscDatabase, adminOnly: true },
 ];
 
 function Settings({ me, onClose, onUpdated }: Props) {
@@ -100,7 +103,9 @@ function Settings({ me, onClose, onUpdated }: Props) {
             {section === "editor" && <EditorPanel />}
             {section === "keyboard" && <KeyboardPanel />}
             {section === "security" && <SecurityPanel me={me} onUpdated={onUpdated} />}
+            {section === "ai" && <AiPanel isAdmin={isAdmin} />}
             {section === "activity" && isAdmin && <ActivityPanel />}
+            {section === "storage" && isAdmin && <StoragePanel />}
           </Box>
         </Box>
       </Flex>
@@ -137,7 +142,9 @@ function fail(toast: ReturnType<typeof useToast>, e: unknown) {
 function ProfilePanel({ me, onUpdated }: { me: Me | null; onUpdated: () => void }) {
   const toast = useToast();
   const [name, setName] = useState(me?.name ?? "");
+  const [username, setUsername] = useState(me?.email ?? "");
   const [saving, setSaving] = useState(false);
+  const [savingU, setSavingU] = useState(false);
 
   async function save(e: FormEvent) {
     e.preventDefault();
@@ -153,18 +160,46 @@ function ProfilePanel({ me, onUpdated }: { me: Me | null; onUpdated: () => void 
     }
   }
 
+  async function saveUsername(e: FormEvent) {
+    e.preventDefault();
+    setSavingU(true);
+    try {
+      await api.updateUsername(username.trim());
+      onUpdated();
+      toast({ title: "Username updated", status: "success", duration: 2000 });
+    } catch (err) {
+      fail(toast, err);
+    } finally {
+      setSavingU(false);
+    }
+  }
+
   return (
     <>
-      <PanelHead title="Profile" sub="How you appear to others in your org." />
+      <PanelHead title="Profile" sub="Your login username and how you appear to others." />
       <Card>
-        <FormControl mb={4}>
-          <FormLabel fontSize="xs" color="ink.muted">
-            Email
-          </FormLabel>
-          <Code fontSize="sm" px={2} py={1} borderRadius="md">
-            {me?.email}
-          </Code>
-        </FormControl>
+        <Box as="form" onSubmit={saveUsername} mb={5}>
+          <FormControl>
+            <FormLabel fontSize="xs" color="ink.muted">
+              Username <Text as="span" color="ink.subtle">(what you sign in with)</Text>
+            </FormLabel>
+            <HStack>
+              <Input
+                size="sm"
+                value={username}
+                placeholder="your username"
+                onChange={(e) => setUsername(e.target.value.replace(/\s/g, ""))}
+                maxW="360px"
+              />
+              <Button size="sm" type="submit" isLoading={savingU} isDisabled={!username.trim() || username.trim() === me?.email}>
+                Change
+              </Button>
+            </HStack>
+            <Text fontSize="xs" color="ink.subtle" mt={1.5}>
+              Must be unique. No spaces or "@" required.
+            </Text>
+          </FormControl>
+        </Box>
         <Box as="form" onSubmit={save}>
           <FormControl>
             <FormLabel fontSize="xs" color="ink.muted">
@@ -346,11 +381,14 @@ function KeyboardPanel() {
   const rows: [string, string][] = [
     ["Ctrl / ⌘  ,", "Open Settings"],
     ["Ctrl / ⌘  B", "Toggle the sidebar"],
+    ["Ctrl / ⌘  P", "Quick-open a file"],
     ["Ctrl / ⌘  Shift  P", "Command palette (in the editor)"],
+    ["Ctrl / ⌘  Shift  V", "Toggle preview (Markdown / HTML)"],
     ["Alt  Z", "Toggle word wrap"],
     ["Ctrl / ⌘  =  /  −", "Increase / decrease font size"],
     ["Ctrl / ⌘  0", "Reset font size"],
     ["Ctrl / ⌘  Tab", "Cycle tabs (while editing)"],
+    ["Ctrl / ⌘  W", "Close current tab (while editing)"],
     ["Ctrl / ⌘  S", "Not needed — everything syncs live"],
   ];
   return (
@@ -377,8 +415,11 @@ function KeyboardPanel() {
         </VStack>
       </Card>
       <Text fontSize="xs" color="ink.subtle" mt={3}>
-        Ctrl+T, Ctrl+W and Ctrl+N are reserved by your browser (new / close / switch browser tab) and can't be
-        reassigned from inside a web app.
+        The browser owns Ctrl+T / Ctrl+N (new tab / window) and usually Ctrl+W, so this app leans on
+        capturable <Kbd>Ctrl/⌘ Shift</Kbd> combos instead — <Kbd>Shift P</Kbd> (commands) and{" "}
+        <Kbd>Shift V</Kbd> (preview). Open files from the Explorer or Quick-open (<Kbd>Ctrl/⌘ P</Kbd>) and
+        close them with the ✕ on a tab; Ctrl+W closes the active tab while the editor is focused (some
+        browsers may still intercept it).
       </Text>
     </>
   );
@@ -595,6 +636,8 @@ const ACTIONS: Record<string, { label: string; color: string }> = {
   admin_delete_user: { label: "Delete user", color: "red" },
   admin_reset_password: { label: "Reset password", color: "orange" },
   admin_reset_2fa: { label: "Reset 2FA", color: "orange" },
+  ai_chat: { label: "AI query", color: "cyan" },
+  ai_provider_set: { label: "AI config", color: "cyan" },
 };
 
 function ActivityPanel() {
@@ -656,6 +699,293 @@ function ActivityPanel() {
           </VStack>
         )}
       </Card>
+    </>
+  );
+}
+
+// ----- AI provider config -----
+const MODEL_HINTS: Record<string, string> = {
+  anthropic: "e.g. claude-opus-5, claude-sonnet-5, claude-haiku-4-5",
+  openai: "e.g. gpt-4o, gpt-4o-mini, or your model name",
+};
+
+function ProviderForm({
+  scope,
+  initial,
+  storageReady,
+  onChanged,
+}: {
+  scope: "user" | "org";
+  initial: api.AiProviderView | null | undefined;
+  storageReady: boolean;
+  onChanged: () => void;
+}) {
+  const toast = useToast();
+  const [provider, setProvider] = useState<"anthropic" | "openai">(initial?.provider ?? "anthropic");
+  const [baseUrl, setBaseUrl] = useState(initial?.base_url ?? "");
+  const [model, setModel] = useState(initial?.model ?? "");
+  const [key, setKey] = useState("");
+  const [saving, setSaving] = useState(false);
+  const hasKey = !!initial?.has_key;
+
+  async function save(e: FormEvent) {
+    e.preventDefault();
+    if (!model.trim()) return;
+    setSaving(true);
+    try {
+      await api.saveAiProvider({
+        scope,
+        provider,
+        base_url: baseUrl.trim() || undefined,
+        model: model.trim(),
+        key: key.trim() || undefined,
+      });
+      setKey("");
+      onChanged();
+      toast({ title: "AI provider saved", status: "success", duration: 2000 });
+    } catch (err) {
+      fail(toast, err);
+    } finally {
+      setSaving(false);
+    }
+  }
+  async function clear() {
+    try {
+      await api.deleteAiProvider(scope);
+      setModel("");
+      setBaseUrl("");
+      setKey("");
+      onChanged();
+      toast({ title: "Removed", status: "success", duration: 1800 });
+    } catch (err) {
+      fail(toast, err);
+    }
+  }
+
+  return (
+    <Box as="form" onSubmit={save}>
+      <VStack align="stretch" spacing={3} maxW="440px">
+        <FormControl>
+          <FormLabel fontSize="xs" color="ink.muted">
+            Provider
+          </FormLabel>
+          <Select size="sm" value={provider} onChange={(e) => setProvider(e.target.value as "anthropic" | "openai")}>
+            <option value="anthropic">Anthropic (Claude)</option>
+            <option value="openai">OpenAI-compatible (OpenAI, Azure, OpenRouter, Ollama…)</option>
+          </Select>
+        </FormControl>
+        <FormControl>
+          <FormLabel fontSize="xs" color="ink.muted">
+            Model
+          </FormLabel>
+          <Input size="sm" value={model} placeholder={MODEL_HINTS[provider]} onChange={(e) => setModel(e.target.value)} />
+        </FormControl>
+        <FormControl>
+          <FormLabel fontSize="xs" color="ink.muted">
+            API base URL <Text as="span" color="ink.subtle">(optional — defaults to the provider's)</Text>
+          </FormLabel>
+          <Input
+            size="sm"
+            value={baseUrl}
+            placeholder={provider === "openai" ? "https://api.openai.com/v1" : "https://api.anthropic.com"}
+            onChange={(e) => setBaseUrl(e.target.value)}
+          />
+        </FormControl>
+        <FormControl>
+          <FormLabel fontSize="xs" color="ink.muted">
+            API key {hasKey && <Text as="span" color="green.400">· saved</Text>}
+          </FormLabel>
+          <Input
+            size="sm"
+            type="password"
+            autoComplete="off"
+            value={key}
+            placeholder={hasKey ? "•••••••• (leave blank to keep)" : "Paste your API key"}
+            onChange={(e) => setKey(e.target.value)}
+          />
+        </FormControl>
+        <HStack>
+          <Button size="sm" type="submit" isLoading={saving} isDisabled={!storageReady || !model.trim() || (!hasKey && !key.trim())}>
+            Save
+          </Button>
+          {(hasKey || initial) && (
+            <Button size="sm" variant="ghost" color="red.400" onClick={clear}>
+              Remove
+            </Button>
+          )}
+        </HStack>
+      </VStack>
+    </Box>
+  );
+}
+
+function AiPanel({ isAdmin }: { isAdmin: boolean }) {
+  const toast = useToast();
+  const [data, setData] = useState<api.AiSettings | null>(null);
+  const [loading, setLoading] = useState(true);
+
+  const load = useCallback(() => {
+    setLoading(true);
+    api
+      .getAiSettings()
+      .then(setData)
+      .catch((e) => fail(toast, e))
+      .finally(() => setLoading(false));
+  }, [toast]);
+  useEffect(load, [load]);
+
+  return (
+    <>
+      <PanelHead title="AI" sub="Bring your own model. Keys are encrypted at rest and never shown again." />
+
+      {loading ? (
+        <Text fontSize="sm" color="ink.muted">
+          Loading…
+        </Text>
+      ) : !data ? null : (
+        <>
+          <Card>
+            <Text fontSize="sm" fontWeight={600} mb={1}>
+              Status
+            </Text>
+            {data.effective ? (
+              <Text fontSize="sm" color="ink.muted">
+                Active — using <Code fontSize="xs">{data.effective.model}</Code> via {data.effective.provider} (
+                {data.effective.source === "user" ? "your key" : data.effective.source === "org" ? "org default" : "server key"}).
+              </Text>
+            ) : (
+              <Text fontSize="sm" color="ink.muted">
+                Not configured yet. Add a key below to enable the Assistant.
+              </Text>
+            )}
+            {!data.storage_ready && (
+              <Text fontSize="xs" color="orange.400" mt={2}>
+                Key storage is off: set <Code fontSize="xs">AI_KEY_SECRET</Code> on the server to save keys here. (The
+                server <Code fontSize="xs">ANTHROPIC_API_KEY</Code> env still works as a fallback.)
+              </Text>
+            )}
+          </Card>
+
+          <Card>
+            <Text fontSize="sm" fontWeight={600} mb={1}>
+              Your key
+            </Text>
+            <Text fontSize="xs" color="ink.subtle" mb={4}>
+              A personal provider just for you. Overrides the org default.
+            </Text>
+            <ProviderForm scope="user" initial={data.mine} storageReady={data.storage_ready} onChanged={load} />
+          </Card>
+
+          {isAdmin && (
+            <Card>
+              <Text fontSize="sm" fontWeight={600} mb={1}>
+                Organization default
+              </Text>
+              <Text fontSize="xs" color="ink.subtle" mb={4}>
+                Used by everyone in the org who hasn't set their own key.
+              </Text>
+              <ProviderForm scope="org" initial={data.org} storageReady={data.storage_ready} onChanged={load} />
+              {data.org_users && data.org_users.length > 0 && (
+                <Box mt={5} pt={4} borderTop="1px solid" borderColor="surface.border">
+                  <Text fontSize="xs" color="ink.subtle" mb={2}>
+                    {data.org_users.length} member{data.org_users.length === 1 ? "" : "s"} using a personal key (keys hidden):
+                  </Text>
+                  <VStack align="stretch" spacing={1}>
+                    {data.org_users.map((u) => (
+                      <Text key={u.user_id} fontSize="xs" color="ink.muted">
+                        User #{u.user_id} · {u.provider} · <Code fontSize="xs">{u.model}</Code>
+                      </Text>
+                    ))}
+                  </VStack>
+                </Box>
+              )}
+            </Card>
+          )}
+        </>
+      )}
+    </>
+  );
+}
+
+// ----- Storage (owner / admin) -----
+function humanBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let v = n / 1024;
+  let i = 0;
+  while (v >= 1024 && i < units.length - 1) {
+    v /= 1024;
+    i++;
+  }
+  return `${v.toFixed(1)} ${units[i]}`;
+}
+
+function StoragePanel() {
+  const toast = useToast();
+  const [data, setData] = useState<api.StorageStats | null>(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    api
+      .getStorage()
+      .then(setData)
+      .catch((e) => fail(toast, e))
+      .finally(() => setLoading(false));
+  }, [toast]);
+
+  const rows = [...(data?.tables ?? [])].sort((a, b) => b.rows - a.rows);
+
+  return (
+    <>
+      <PanelHead title="Storage" sub="Database size and what's using it. Back the DB file up regularly (see DEPLOY.md)." />
+      {loading ? (
+        <Text fontSize="sm" color="ink.muted">
+          Loading…
+        </Text>
+      ) : !data ? null : (
+        <>
+          <SimpleGrid columns={{ base: 1, sm: 2 }} spacing={4} mb={5}>
+            <Card>
+              <Text fontSize="xs" color="ink.subtle">
+                Database file
+              </Text>
+              <Text fontSize="2xl" fontWeight={700} sx={{ fontVariantNumeric: "tabular-nums" }}>
+                {humanBytes(data.db_bytes)}
+              </Text>
+            </Card>
+            <Card>
+              <Text fontSize="xs" color="ink.subtle">
+                Uploaded files + images
+              </Text>
+              <Text fontSize="2xl" fontWeight={700} sx={{ fontVariantNumeric: "tabular-nums" }}>
+                {humanBytes(data.blob_bytes)}
+              </Text>
+            </Card>
+          </SimpleGrid>
+          <Card>
+            <Text fontSize="sm" fontWeight={600} mb={2}>
+              Rows by table
+            </Text>
+            <VStack align="stretch" spacing={0}>
+              {rows.map((t, i) => (
+                <Flex
+                  key={t.name}
+                  align="center"
+                  justify="space-between"
+                  py={2}
+                  borderTop={i === 0 ? undefined : "1px solid"}
+                  borderColor="surface.border"
+                >
+                  <Code fontSize="xs">{t.name}</Code>
+                  <Text fontSize="sm" sx={{ fontVariantNumeric: "tabular-nums" }}>
+                    {t.rows.toLocaleString()}
+                  </Text>
+                </Flex>
+              ))}
+            </VStack>
+          </Card>
+        </>
+      )}
     </>
   );
 }

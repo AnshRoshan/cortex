@@ -8,8 +8,9 @@ dist
 
 .vscode
 
-# Backend-only secrets — never commit real seeded credentials or the DB
+# Backend-only secrets — never commit real seeded credentials, keys, or the DB
 seed_users.json
+.env
 *.db
 *.db-journal
 *.db-wal

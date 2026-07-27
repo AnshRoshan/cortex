@@ -145,7 +145,7 @@ function Login({ onSuccess }: LoginProps) {
         setError(
           mfa
             ? "That code isn't right. Enter the current 6 digits from your app."
-            : "That email and password don't match. Try again.",
+            : "That username and password don't match. Try again.",
         );
         setBusy(false);
       }
@@ -227,13 +227,13 @@ function Login({ onSuccess }: LoginProps) {
                 <>
                   <FormControl isRequired>
                     <FormLabel fontSize="xs" color="ink.muted" mb={1.5}>
-                      Email
+                      Username
                     </FormLabel>
                     <Input
                       value={email}
                       autoFocus
                       autoComplete="username"
-                      placeholder="you@company.com"
+                      placeholder="your username"
                       onChange={(e) => setEmail(e.target.value)}
                     />
                   </FormControl>

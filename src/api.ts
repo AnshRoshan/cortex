@@ -85,6 +85,9 @@ export async function logout(): Promise<void> {
 export async function updateName(name: string): Promise<void> {
   await json(await fetch("/api/profile", opts("POST", { name })));
 }
+export async function updateUsername(username: string): Promise<void> {
+  await json(await fetch("/api/profile/username", opts("POST", { username })));
+}
 export async function changePassword(current: string, newPassword: string): Promise<void> {
   await json(await fetch("/api/profile/password", opts("POST", { current, new: newPassword })));
 }
@@ -213,6 +216,47 @@ export async function pingTypingDm(withId: number, orgId?: number): Promise<void
 }
 export async function toggleReaction(kind: "ws" | "dm", msgId: number, emoji: string): Promise<void> {
   await encFetch(`/api/reaction`, { method: "POST", body: { kind, msg_id: msgId, emoji } });
+}
+
+// ----- AI assistant (grounded in the workspace's files; server holds the key) -----
+export type AiMessage = { role: "user" | "assistant"; content: string };
+export async function aiChat(workspaceId: number, messages: AiMessage[]): Promise<{ reply: string }> {
+  const res = await fetch("/api/ai/chat", opts("POST", { workspace_id: workspaceId, messages }));
+  if (res.status === 503) throw new Error("AI isn't set up on this server yet.");
+  return json(res);
+}
+
+// ----- AI provider settings (keys are write-only; never returned) -----
+export type AiProviderView = { provider: "anthropic" | "openai"; base_url: string | null; model: string; has_key: boolean };
+export type AiSettings = {
+  storage_ready: boolean; // AI_KEY_SECRET is set (keys can be stored)
+  env_fallback: boolean; // server ANTHROPIC_API_KEY is set
+  is_admin: boolean;
+  mine: AiProviderView | null;
+  effective: { source: "user" | "org" | "env"; provider: string; model: string } | null;
+  org?: AiProviderView | null;
+  org_users?: { user_id: number; provider: string; model: string }[];
+};
+export async function getAiSettings(): Promise<AiSettings> {
+  return json(await fetch("/api/ai/settings", { credentials: "include" }));
+}
+export async function saveAiProvider(body: {
+  scope: "user" | "org";
+  provider: "anthropic" | "openai";
+  base_url?: string;
+  model: string;
+  key?: string;
+}): Promise<void> {
+  await json(await fetch("/api/ai/providers", opts("POST", body)));
+}
+export async function deleteAiProvider(scope: "user" | "org"): Promise<void> {
+  await json(await fetch(`/api/ai/providers?scope=${scope}`, opts("DELETE")));
+}
+
+// ----- storage stats (owner / admin) -----
+export type StorageStats = { db_bytes: number; blob_bytes: number; tables: { name: string; rows: number }[] };
+export async function getStorage(): Promise<StorageStats> {
+  return json(await fetch("/api/admin/storage", { credentials: "include" }));
 }
 
 // ----- unread overview (per-thread summary for the sidebar) -----

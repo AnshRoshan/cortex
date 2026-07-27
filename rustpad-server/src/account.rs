@@ -97,6 +97,13 @@ pub fn routes(db: Database) -> impl Filter<Extract = (impl Reply,), Error = Reje
         .and(warp::body::json())
         .and_then(update_name);
 
+    let change_username = warp::path!("profile" / "username")
+        .and(warp::post())
+        .and(with_auth(db.clone()))
+        .and(with_db(db.clone()))
+        .and(warp::body::json())
+        .and_then(update_username);
+
     let change_pw = warp::path!("profile" / "password")
         .and(warp::post())
         .and(with_auth(db.clone()))
@@ -190,6 +197,7 @@ pub fn routes(db: Database) -> impl Filter<Extract = (impl Reply,), Error = Reje
         .and_then(org_delete);
 
     update_name
+        .or(change_username)
         .or(change_pw)
         .or(tfa_setup)
         .or(tfa_enable)
@@ -215,6 +223,30 @@ async fn update_name(user: User, db: Database, body: NameReq) -> Result<impl Rep
         return Ok(err(StatusCode::INTERNAL_SERVER_ERROR, "could not update"));
     }
     Ok(warp::reply::json(&json!({ "ok": true, "name": name })).into_response())
+}
+
+#[derive(serde::Deserialize)]
+struct UsernameReq {
+    username: String,
+}
+
+/// Change the caller's own login username (the `email` column). Enforced-unique.
+async fn update_username(user: User, db: Database, body: UsernameReq) -> Result<impl Reply, Rejection> {
+    let uname = body.username.trim().to_lowercase();
+    if uname.is_empty() || uname.len() > 120 {
+        return Ok(err(StatusCode::BAD_REQUEST, "username must be 1–120 characters"));
+    }
+    if uname.chars().any(char::is_whitespace) {
+        return Ok(err(StatusCode::BAD_REQUEST, "username can't contain spaces"));
+    }
+    match db.update_email(user.id, &uname).await {
+        Ok(true) => {
+            let _ = db.audit(user.org_id, Some(user.id), "change_username", Some(&uname), now_secs()).await;
+            Ok(warp::reply::json(&json!({ "ok": true, "username": uname })).into_response())
+        }
+        Ok(false) => Ok(err(StatusCode::CONFLICT, "that username is already taken")),
+        Err(_) => Ok(err(StatusCode::INTERNAL_SERVER_ERROR, "could not update")),
+    }
 }
 
 async fn change_password(

@@ -95,6 +95,37 @@ OWNER_2FA_RESET=1 DOMAIN=<ELASTIC_IP>.sslip.io docker compose -f docker-compose.
 DOMAIN=<ELASTIC_IP>.sslip.io docker compose -f docker-compose.prod.yml up -d
 ```
 
+## AI assistant (optional)
+
+The workspace has a built-in AI assistant (✨ in the activity bar) that answers
+questions grounded in the workspace's files. It's **off until a key exists** and
+supports **Anthropic (Claude)** and any **OpenAI-compatible** endpoint (OpenAI,
+Azure, OpenRouter, local Ollama, …).
+
+Two ways to provide a key, lowest-effort first:
+
+1. **Server-wide default (env):** put `ANTHROPIC_API_KEY=sk-ant-…` (optionally
+   `AI_MODEL=claude-haiku-4-5` for cost) in a `.env` file next to
+   `docker-compose.prod.yml`. Everyone in the org can use the assistant.
+
+2. **Bring-your-own-key (per user / per org, in the UI):** set a random
+   `AI_KEY_SECRET` in the same `.env` — this is the master secret that
+   **encrypts stored keys at rest** (AES-GCM). Then each person adds their own
+   provider + key under **Settings → AI**, and the owner/admin can set an
+   **org default** there. Keys are write-only: they're never returned to the
+   browser or written to logs. Without `AI_KEY_SECRET`, only option 1 works.
+
+```sh
+# .env (next to docker-compose.prod.yml)
+AI_KEY_SECRET=$(openssl rand -hex 32)     # enables per-user/org keys in the UI
+ANTHROPIC_API_KEY=sk-ant-...              # optional server-wide fallback
+AI_MODEL=claude-opus-5                     # optional; env fallback's model
+```
+
+Rotating `AI_KEY_SECRET` invalidates all stored keys (users re-enter them) — pick
+it once and keep it. DB size and per-table usage are visible in **Settings →
+Storage** (owner/admin).
+
 ## Notes
 
 - `COOKIE_SECURE=1` is set in the prod compose (session cookie is HTTPS-only).

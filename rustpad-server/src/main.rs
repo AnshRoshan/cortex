@@ -17,9 +17,9 @@ async fn main() {
         .await
         .expect("Unable to connect to SQLITE_URI");
 
-    // Seed users from the backend-only seed file (the only way users are created).
-    let seed_file = std::env::var("SEED_FILE").unwrap_or_else(|_| String::from("seed_users.json"));
-    auth::seed_from_file(&database, &seed_file).await;
+    // Seed users from SEED_USERS (env JSON) or the SEED_FILE — the only way users
+    // are created.
+    auth::seed_users(&database).await;
 
     // Break-glass: set OWNER_2FA_RESET=1 on the host to clear the owner's 2FA if
     // the authenticator device is ever lost. Only the owner controls the host.

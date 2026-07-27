@@ -19,7 +19,7 @@ use warp::{http::StatusCode, hyper::Body, reply::Reply, Filter, Rejection};
 
 use crate::auth::{with_auth, Forbidden};
 use crate::crypto;
-use crate::database::{ChatMessage, Database, PersistedDocument, ReactionView, User, Workspace};
+use crate::database::{ChatMessage, Database, PersistedDocument, ProviderRow, ReactionView, User, Workspace};
 
 /// Filter extracting the client's ECDH public key header (present when the
 /// client encrypts the payload).
@@ -435,6 +435,47 @@ pub fn routes(db: Database) -> impl Filter<Extract = (impl Reply,), Error = Reje
         .and(with_db(db.clone()))
         .and_then(audit_log);
 
+    let ai_chat_r = warp::path!("ai" / "chat")
+        .and(warp::post())
+        .and(with_auth(db.clone()))
+        .and(with_db(db.clone()))
+        .and(warp::body::json())
+        .and_then(ai_chat);
+
+    let ai_settings_r = warp::path!("ai" / "settings")
+        .and(warp::get())
+        .and(with_auth(db.clone()))
+        .and(with_db(db.clone()))
+        .and_then(get_ai_settings);
+
+    let ai_set_r = warp::path!("ai" / "providers")
+        .and(warp::post())
+        .and(with_auth(db.clone()))
+        .and(with_db(db.clone()))
+        .and(warp::body::json())
+        .and_then(set_ai_provider);
+
+    let ai_del_r = warp::path!("ai" / "providers")
+        .and(warp::delete())
+        .and(with_auth(db.clone()))
+        .and(with_db(db.clone()))
+        .and(warp::query::<ProviderScope>())
+        .and_then(delete_ai_provider);
+
+    let storage_r = warp::path!("admin" / "storage")
+        .and(warp::get())
+        .and(with_auth(db.clone()))
+        .and(with_db(db.clone()))
+        .and_then(admin_storage);
+
+    // Grouped + boxed to keep the `.or()` type shallow (E0275 guard).
+    let ai_routes = ai_chat_r
+        .or(ai_settings_r)
+        .or(ai_set_r)
+        .or(ai_del_r)
+        .or(storage_r)
+        .boxed();
+
     // Chat images (pasted into chat) — stored separately from workspace files.
     let post_chat_image = warp::path!("chat-image")
         .and(warp::post())
@@ -487,7 +528,7 @@ pub fn routes(db: Database) -> impl Filter<Extract = (impl Reply,), Error = Reje
         .or(get_chat_image_r)
         .boxed();
 
-    workspace_routes.or(chat_routes)
+    workspace_routes.or(chat_routes).or(ai_routes)
 }
 
 async fn get_org(user: User, db: Database, q: OrgQuery) -> Result<impl Reply, Rejection> {
@@ -748,6 +789,334 @@ async fn move_file(
         Ok(_) => Ok(warp::reply::json(&json!({ "ok": true })).into_response()),
         Err(_) => Ok(err(StatusCode::BAD_REQUEST, "a file already exists at that path")),
     }
+}
+
+#[derive(Deserialize)]
+struct AiMsg {
+    role: String,
+    content: String,
+}
+
+#[derive(Deserialize)]
+struct AiChatReq {
+    workspace_id: i64,
+    messages: Vec<AiMsg>,
+}
+
+/// A resolved, ready-to-call provider: a decrypted key plus where/how to call.
+struct ResolvedProvider {
+    provider: String, // "anthropic" | "openai"
+    base_url: Option<String>,
+    model: String,
+    api_key: String,
+    source: &'static str, // "user" | "org" | "env"
+}
+
+/// Resolve which provider to use for this user: their personal config, else the
+/// org default, else the server ANTHROPIC_API_KEY env fallback, else none.
+async fn resolve_provider(db: &Database, user: &User) -> Option<ResolvedProvider> {
+    if let Some(row) = db.get_provider("user", user.id).await.ok().flatten() {
+        if let Some(key) = crypto::secret_decrypt(&row.key_cipher) {
+            return Some(ResolvedProvider {
+                provider: row.provider,
+                base_url: row.base_url,
+                model: row.model,
+                api_key: key,
+                source: "user",
+            });
+        }
+    }
+    if let Some(org) = user.org_id {
+        if let Some(row) = db.get_provider("org", org).await.ok().flatten() {
+            if let Some(key) = crypto::secret_decrypt(&row.key_cipher) {
+                return Some(ResolvedProvider {
+                    provider: row.provider,
+                    base_url: row.base_url,
+                    model: row.model,
+                    api_key: key,
+                    source: "org",
+                });
+            }
+        }
+    }
+    match std::env::var("ANTHROPIC_API_KEY") {
+        Ok(k) if !k.trim().is_empty() => Some(ResolvedProvider {
+            provider: "anthropic".to_string(),
+            base_url: None,
+            model: std::env::var("AI_MODEL").unwrap_or_else(|_| "claude-opus-5".to_string()),
+            api_key: k,
+            source: "env",
+        }),
+        _ => None,
+    }
+}
+
+/// Build the capped file-context blob for a workspace.
+async fn workspace_context(db: &Database, workspace_id: i64) -> String {
+    // ponytail: whole-file stuffing, no embeddings/RAG — fine for the small
+    // workspaces this targets; add retrieval if files outgrow the cap.
+    let files = db.list_files(workspace_id).await.unwrap_or_default();
+    let mut ctx = String::new();
+    let mut budget: usize = 120_000; // ~30k tokens of file text
+    for f in &files {
+        if f.kind != "text" || budget == 0 {
+            continue;
+        }
+        if let Ok(doc) = db.load(&f.doc_id).await {
+            let header = format!("\n\n===== FILE: {} =====\n", f.path);
+            ctx.push_str(&header);
+            let room = budget.saturating_sub(header.len());
+            if doc.text.len() > room {
+                ctx.extend(doc.text.chars().take(room));
+                ctx.push_str("\n…(truncated)…");
+                budget = 0;
+            } else {
+                ctx.push_str(&doc.text);
+                budget -= header.len() + doc.text.len();
+            }
+        }
+    }
+    ctx
+}
+
+fn trim_url(base: &str) -> &str {
+    base.trim().trim_end_matches('/')
+}
+
+/// AI assistant grounded in the workspace's text files. Calls the resolved
+/// provider (Anthropic Messages API or any OpenAI-compatible chat endpoint) over
+/// raw HTTPS. Keys stay server-side — never sent to the browser.
+async fn ai_chat(user: User, db: Database, body: AiChatReq) -> Result<impl Reply, Rejection> {
+    ensure_ws(&db, &user, body.workspace_id).await?;
+
+    let prov = match resolve_provider(&db, &user).await {
+        Some(p) => p,
+        None => return Ok(err(StatusCode::SERVICE_UNAVAILABLE, "AI is not configured. Add a provider in Settings → AI.")),
+    };
+
+    let context = workspace_context(&db, body.workspace_id).await;
+    let system = format!(
+        "You are Cortex Assistant, an AI helper embedded in a private, self-hosted collaborative \
+         workspace for code and notes. Answer the user's questions about the workspace's files. \
+         Be concise and accurate, use Markdown, and name the file when you reference one. If the \
+         answer isn't in the files, say so plainly. Do not include internal or system XML tags in \
+         your reply.\n\nWorkspace files:\n{}",
+        if context.is_empty() { "(no readable text files yet)".to_string() } else { context }
+    );
+
+    let msgs: Vec<serde_json::Value> = body
+        .messages
+        .iter()
+        .filter(|m| m.role == "user" || m.role == "assistant")
+        .map(|m| json!({ "role": m.role, "content": m.content }))
+        .collect();
+    if msgs.is_empty() {
+        return Ok(err(StatusCode::BAD_REQUEST, "no message"));
+    }
+
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return Ok(err(StatusCode::INTERNAL_SERVER_ERROR, "AI client init failed")),
+    };
+
+    // Build the request for the chosen wire format.
+    let req = if prov.provider == "openai" {
+        // OpenAI-compatible: system is the first message; Bearer auth.
+        let base = prov.base_url.as_deref().map(trim_url).unwrap_or("https://api.openai.com/v1");
+        let mut oai_msgs = vec![json!({ "role": "system", "content": system })];
+        oai_msgs.extend(msgs.iter().cloned());
+        client
+            .post(format!("{}/chat/completions", base))
+            .header("authorization", format!("Bearer {}", prov.api_key))
+            .json(&json!({ "model": prov.model, "max_tokens": 8192, "messages": oai_msgs }))
+    } else {
+        let base = prov.base_url.as_deref().map(trim_url).unwrap_or("https://api.anthropic.com");
+        client
+            .post(format!("{}/v1/messages", base))
+            .header("x-api-key", prov.api_key.clone())
+            .header("anthropic-version", "2023-06-01")
+            .json(&json!({ "model": prov.model, "max_tokens": 8192, "system": system, "messages": msgs }))
+    };
+
+    let resp = match req.header("content-type", "application/json").send().await {
+        Ok(r) => r,
+        Err(_) => return Ok(err(StatusCode::BAD_GATEWAY, "could not reach the AI service")),
+    };
+    if !resp.status().is_success() {
+        let code = resp.status();
+        let detail = resp.text().await.unwrap_or_default();
+        log::warn!("AI provider error {}: {}", code, detail);
+        return Ok(err(StatusCode::BAD_GATEWAY, "the AI service returned an error"));
+    }
+    let val: serde_json::Value = match resp.json().await {
+        Ok(v) => v,
+        Err(_) => return Ok(err(StatusCode::BAD_GATEWAY, "bad AI response")),
+    };
+
+    let reply = if prov.provider == "openai" {
+        val.pointer("/choices/0/message/content").and_then(|v| v.as_str()).unwrap_or_default().to_string()
+    } else {
+        val.get("content")
+            .and_then(|c| c.as_array())
+            .map(|blocks| {
+                blocks
+                    .iter()
+                    .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
+                    .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                    .collect::<Vec<_>>()
+                    .join("")
+            })
+            .unwrap_or_default()
+    };
+    let _ = db.audit(user.org_id, Some(user.id), "ai_chat", None, now_secs()).await;
+    Ok(warp::reply::json(&json!({ "reply": reply, "source": prov.source })).into_response())
+}
+
+#[derive(Deserialize)]
+struct ProviderBody {
+    scope: String, // "user" | "org"
+    provider: String,
+    #[serde(default)]
+    base_url: Option<String>,
+    model: String,
+    #[serde(default)]
+    key: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ProviderScope {
+    scope: String,
+}
+
+fn mask_provider(row: &ProviderRow) -> serde_json::Value {
+    json!({ "provider": row.provider, "base_url": row.base_url, "model": row.model, "has_key": true })
+}
+
+/// The caller's AI settings view: their own config, the org default + per-user
+/// overview (owner/admin only), and whether the feature is usable at all.
+async fn get_ai_settings(user: User, db: Database) -> Result<impl Reply, Rejection> {
+    let is_admin = user.role == "admin" || user.role == "root";
+    let mine = db.get_provider("user", user.id).await.ok().flatten();
+    let effective = resolve_provider(&db, &user).await;
+
+    let mut out = json!({
+        "storage_ready": crypto::secret_storage_ready(),
+        "env_fallback": std::env::var("ANTHROPIC_API_KEY").map(|k| !k.trim().is_empty()).unwrap_or(false),
+        "is_admin": is_admin,
+        "mine": mine.as_ref().map(mask_provider),
+        "effective": effective.map(|e| json!({ "source": e.source, "provider": e.provider, "model": e.model })),
+    });
+
+    if is_admin {
+        if let Some(org) = user.org_id {
+            let org_cfg = db.get_provider("org", org).await.ok().flatten();
+            let users: Vec<serde_json::Value> = db
+                .org_user_providers(org)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(uid, provider, model)| json!({ "user_id": uid, "provider": provider, "model": model }))
+                .collect();
+            out["org"] = org_cfg.as_ref().map(mask_provider).unwrap_or(serde_json::Value::Null);
+            out["org_users"] = json!(users);
+        }
+    }
+    Ok(warp::reply::json(&out).into_response())
+}
+
+/// Create/update a provider config. Users may set only their own; org scope is
+/// owner/admin only. Key is required on first save; omit it to keep the existing.
+async fn set_ai_provider(user: User, db: Database, body: ProviderBody) -> Result<impl Reply, Rejection> {
+    if !crypto::secret_storage_ready() {
+        return Ok(err(StatusCode::SERVICE_UNAVAILABLE, "Key storage isn't configured (set AI_KEY_SECRET)."));
+    }
+    if body.provider != "anthropic" && body.provider != "openai" {
+        return Ok(err(StatusCode::BAD_REQUEST, "unknown provider"));
+    }
+    if body.model.trim().is_empty() {
+        return Ok(err(StatusCode::BAD_REQUEST, "model is required"));
+    }
+    let is_admin = user.role == "admin" || user.role == "root";
+    let (scope, scope_id) = match body.scope.as_str() {
+        "user" => ("user", user.id),
+        "org" => {
+            if !is_admin {
+                return Err(warp::reject::custom(Forbidden));
+            }
+            match user.org_id {
+                Some(o) => ("org", o),
+                None => return Ok(err(StatusCode::BAD_REQUEST, "no org to configure")),
+            }
+        }
+        _ => return Ok(err(StatusCode::BAD_REQUEST, "bad scope")),
+    };
+
+    // Encrypt the new key, or keep the existing cipher when the key is omitted.
+    let key_cipher = match body.key.as_deref().map(str::trim).filter(|k| !k.is_empty()) {
+        Some(k) => match crypto::secret_encrypt(k) {
+            Some(c) => c,
+            None => return Ok(err(StatusCode::INTERNAL_SERVER_ERROR, "could not encrypt key")),
+        },
+        None => match db.get_provider(scope, scope_id).await.ok().flatten() {
+            Some(row) => row.key_cipher,
+            None => return Ok(err(StatusCode::BAD_REQUEST, "an API key is required")),
+        },
+    };
+    let base = body.base_url.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    if db
+        .upsert_provider(scope, scope_id, &body.provider, base, body.model.trim(), &key_cipher, now_secs())
+        .await
+        .is_err()
+    {
+        return Ok(err(StatusCode::INTERNAL_SERVER_ERROR, "could not save"));
+    }
+    let _ = db.audit(user.org_id, Some(user.id), "ai_provider_set", Some(scope), now_secs()).await;
+    Ok(warp::reply::json(&json!({ "ok": true })).into_response())
+}
+
+async fn delete_ai_provider(user: User, db: Database, q: ProviderScope) -> Result<impl Reply, Rejection> {
+    let is_admin = user.role == "admin" || user.role == "root";
+    let (scope, scope_id) = match q.scope.as_str() {
+        "user" => ("user", user.id),
+        "org" => {
+            if !is_admin {
+                return Err(warp::reject::custom(Forbidden));
+            }
+            match user.org_id {
+                Some(o) => ("org", o),
+                None => return Ok(err(StatusCode::BAD_REQUEST, "no org")),
+            }
+        }
+        _ => return Ok(err(StatusCode::BAD_REQUEST, "bad scope")),
+    };
+    let _ = db.delete_provider(scope, scope_id).await;
+    Ok(warp::reply::json(&json!({ "ok": true })).into_response())
+}
+
+/// Owner/admin storage readout: DB file size, blob bytes, and per-table rows.
+async fn admin_storage(user: User, db: Database) -> Result<impl Reply, Rejection> {
+    if user.role != "admin" && user.role != "root" {
+        return Err(warp::reject::custom(Forbidden));
+    }
+    const TABLES: &[&str] = &[
+        "users", "org", "workspace", "file", "document", "message", "dm",
+        "reaction", "chat_image", "file_blob", "audit", "session",
+    ];
+    let mut tables = Vec::new();
+    for t in TABLES {
+        if let Ok(n) = db.table_rows(t).await {
+            tables.push(json!({ "name": t, "rows": n }));
+        }
+    }
+    Ok(warp::reply::json(&json!({
+        "db_bytes": db.db_size_bytes().await.unwrap_or(0),
+        "blob_bytes": db.blob_bytes().await.unwrap_or(0),
+        "tables": tables,
+    }))
+    .into_response())
 }
 
 /// Per-thread summary for the sidebar: latest message (id, sender, preview, time)

@@ -32,6 +32,7 @@ import ChatChannels, { ChatTarget } from "./ChatChannels";
 import CommandPalette, { PaletteItem } from "./CommandPalette";
 import { fileIcon } from "./fileIcon";
 import ChatView from "./ChatView";
+import AiView from "./AiView";
 import { ConfirmModal, PromptModal } from "./Dialogs";
 import EditorPane from "./EditorPane";
 import FileTree, { allFolderPaths, FileTreeHandle } from "./FileTree";
@@ -816,7 +817,9 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
       )}
 
       {/* Main pane */}
-      {section === "chat" && !settingsOpen ? (
+      {section === "assistant" && !settingsOpen ? (
+        <AiView workspaceId={activeWsId} />
+      ) : section === "chat" && !settingsOpen ? (
         <ChatView
           me={me}
           orgId={orgId}
