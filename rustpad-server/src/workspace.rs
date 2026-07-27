@@ -19,7 +19,7 @@ use warp::{http::StatusCode, hyper::Body, reply::Reply, Filter, Rejection};
 
 use crate::auth::{with_auth, Forbidden};
 use crate::crypto;
-use crate::database::{ChatMessage, Database, ReactionView, User, Workspace};
+use crate::database::{ChatMessage, Database, PersistedDocument, ReactionView, User, Workspace};
 
 /// Filter extracting the client's ECDH public key header (present when the
 /// client encrypts the payload).
@@ -197,6 +197,28 @@ struct DmQuery {
     org: Option<i64>,
 }
 
+#[derive(Deserialize, Default)]
+struct OverviewReq {
+    #[serde(default)]
+    workspace_id: Option<i64>,
+    #[serde(default)]
+    org: Option<i64>,
+    #[serde(default)]
+    ws_read: Option<i64>,
+    #[serde(default)]
+    dm_read: HashMap<i64, i64>,
+}
+
+/// Trim a message body to a short one-line preview for the sidebar.
+fn preview(body: &str) -> String {
+    let s = body.trim().replace('\n', " ");
+    if s.chars().count() > 140 {
+        s.chars().take(140).collect::<String>() + "…"
+    } else {
+        s
+    }
+}
+
 /// The org a DM acts within: the user's own, or (for root) `?org=`.
 fn dm_org(user: &User, q: &DmQuery) -> Option<i64> {
     if user.role == "root" {
@@ -282,6 +304,14 @@ pub fn routes(db: Database) -> impl Filter<Extract = (impl Reply,), Error = Reje
         .and_then(delete_file);
 
     // Workspace group chat.
+    let chat_overview_r = warp::path!("chat" / "overview")
+        .and(warp::post())
+        .and(with_auth(db.clone()))
+        .and(with_db(db.clone()))
+        .and(epk_header())
+        .and(warp::body::bytes())
+        .and_then(chat_overview);
+
     let get_chat_r = warp::path!("chat")
         .and(warp::get())
         .and(with_auth(db.clone()))
@@ -437,7 +467,8 @@ pub fn routes(db: Database) -> impl Filter<Extract = (impl Reply,), Error = Reje
         .or(audit_r)
         .boxed();
 
-    let chat_routes = get_chat_r
+    let chat_routes = chat_overview_r
+        .or(get_chat_r)
         .or(post_chat_r)
         .or(clear_chat_r)
         .or(get_dm_r)
@@ -587,9 +618,20 @@ async fn upload_file(
         Some(f) => f,
         None => return Ok(err(StatusCode::BAD_REQUEST, "no file field")),
     };
+    // Text uploads (source, .txt, .md, JSON…) open in the editor; store them as
+    // seeded OT documents so they're readable and collaboratively editable.
+    // Anything that isn't valid UTF-8, contains a NUL byte, or is large stays a
+    // binary blob. ponytail: 1 MB text cap keeps huge files out of the in-memory
+    // OT model; raise it if real docs get truncated to binary.
+    let text = if bytes.len() <= 1_000_000 {
+        std::str::from_utf8(&bytes).ok().filter(|s| !s.contains('\0'))
+    } else {
+        None
+    };
     let doc_id = random_doc_id();
+    let kind = if text.is_some() { "text" } else { "binary" };
     let file = match db
-        .create_file(q.workspace_id, &filename, &doc_id, "binary", mime.as_deref(), now_secs())
+        .create_file(q.workspace_id, &filename, &doc_id, kind, mime.as_deref(), now_secs())
         .await
     {
         Ok(file) => file,
@@ -600,7 +642,17 @@ async fn upload_file(
             ))
         }
     };
-    if db.store_blob(file.id, &bytes).await.is_err() {
+    let stored = match text {
+        Some(t) => db
+            .store(
+                &doc_id,
+                &PersistedDocument { text: t.replace("\r\n", "\n"), language: None },
+            )
+            .await
+            .is_ok(),
+        None => db.store_blob(file.id, &bytes).await.is_ok(),
+    };
+    if !stored {
         return Ok(err(StatusCode::INTERNAL_SERVER_ERROR, "could not store file"));
     }
     let _ = db.audit(user.org_id, Some(user.id), "upload", Some(&filename), now_secs()).await;
@@ -696,6 +748,52 @@ async fn move_file(
         Ok(_) => Ok(warp::reply::json(&json!({ "ok": true })).into_response()),
         Err(_) => Ok(err(StatusCode::BAD_REQUEST, "a file already exists at that path")),
     }
+}
+
+/// Per-thread summary for the sidebar: latest message (id, sender, preview, time)
+/// plus the unread count relative to the client's read markers. Carries message
+/// previews, so it's ECIES-sealed like the rest of chat.
+/// ponytail: one COUNT query per thread — fine for the small locked-down orgs this
+/// targets; batch into a single grouped query if peer counts ever get large.
+async fn chat_overview(
+    user: User,
+    db: Database,
+    epk: Option<String>,
+    raw: bytes::Bytes,
+) -> Result<impl Reply, Rejection> {
+    let req: OverviewReq = crypto::open_request(&epk, &raw)
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default();
+
+    let ws = if let Some(id) = req.workspace_id {
+        if ensure_ws(&db, &user, id).await.is_ok() {
+            match db.workspace_last_msg(id).await.ok().flatten() {
+                Some((last_id, sender, body, at)) => {
+                    let unread = db
+                        .ws_unread_count(id, user.id, req.ws_read.unwrap_or(0))
+                        .await
+                        .unwrap_or(0);
+                    Some(json!({ "last_id": last_id, "last_sender": sender, "body": preview(&body), "at": at, "unread": unread }))
+                }
+                None => None,
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let org = if user.role == "root" { req.org } else { user.org_id };
+    let mut dms = Vec::new();
+    if let Some(org) = org {
+        for (peer, last_id, sender, body, at) in db.dm_overview(org, user.id).await.unwrap_or_default() {
+            let after = req.dm_read.get(&peer).copied().unwrap_or(0);
+            let unread = db.dm_unread_count(org, user.id, peer, after).await.unwrap_or(0);
+            dms.push(json!({ "peer_id": peer, "last_id": last_id, "last_sender": sender, "body": preview(&body), "at": at, "unread": unread }));
+        }
+    }
+    Ok(crypto::seal_reply(&epk, &json!({ "ws": ws, "dms": dms })))
 }
 
 async fn get_chat(

@@ -35,6 +35,7 @@ import {
 } from "react-icons/vsc";
 
 import MarkdownPreview from "./MarkdownPreview";
+import HtmlPreview from "./HtmlPreview";
 
 import * as api from "./api";
 import { FileRow } from "./api";
@@ -480,7 +481,13 @@ function EditorGroup({
   const [pos, setPos] = useState({ ln: 1, col: 1 });
   const [counts, setCounts] = useState({ rows: 0, words: 0, chars: 0 });
   const [langOverride, setLangOverride] = useState<string | null>(null);
+  // Preview is a real, persistent tab: `preview` = the tab exists, `view` =
+  // which of editor/preview is showing (so switching between them doesn't
+  // destroy the preview), `previewPos` = its slot among the file tabs so it
+  // can be dragged left/right within this group's strip.
   const [preview, setPreview] = useState(false);
+  const [view, setView] = useState<"editor" | "preview">("editor");
+  const [previewPos, setPreviewPos] = useState(0);
   const [mdText, setMdText] = useState("");
 
   const stateRef = useRef({ openFiles, activeFileId, onSelectTab, onCloseTab });
@@ -553,11 +560,19 @@ function EditorGroup({
   const autoLang = activeFile ? extToLang(activeFile.path) : "plaintext";
   const language = langOverride ?? autoLang;
   const isMarkdown = /\.(md|markdown)$/i.test(activeFile?.path ?? "");
-  const previewActive = isMarkdown && preview;
+  const isHtml = /\.html?$/i.test(activeFile?.path ?? "");
+  const previewable = isMarkdown || isHtml;
+  const previewTab = preview && previewable; // the tab is present
+  const previewActive = previewTab && view === "preview"; // and currently shown
+  const slot = Math.min(previewPos, openFiles.length);
 
   useEffect(() => {
     setLangOverride(null);
-    setPreview(false); // preview is per-file; close it when the active file changes
+    // Preview is per-file: reset the tab/view when the active file changes.
+    setPreview(false);
+    setView("editor");
+    setPreviewPos(openFiles.length);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [docId]);
 
   useEffect(() => {
@@ -624,11 +639,77 @@ function EditorGroup({
     e.preventDefault();
     e.stopPropagation();
     try {
-      onTabDropAt(JSON.parse(e.dataTransfer.getData("text/plain")), atIndex);
+      const p = JSON.parse(e.dataTransfer.getData("text/plain"));
+      if (p.preview) setPreviewPos(atIndex); // move the preview tab within this strip
+      else onTabDropAt(p, atIndex);
     } catch {
       /* ignore */
     }
   }
+
+  // Dropping the preview tab in empty strip space parks it after the last file.
+  function stripDrop(e: DragEvent) {
+    try {
+      const p = JSON.parse(e.dataTransfer.getData("text/plain"));
+      if (p.preview) {
+        e.preventDefault();
+        e.stopPropagation();
+        setPreviewPos(openFiles.length);
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+
+  const previewTabEl = previewTab ? (
+    <HStack
+      key="__preview__"
+      draggable
+      onDragStart={(e: DragEvent) => e.dataTransfer.setData("text/plain", JSON.stringify({ preview: true, g: index }))}
+      onDragOver={(e) => {
+        e.preventDefault();
+        e.stopPropagation();
+      }}
+      onDrop={(e) => tabDrop(e, slot)}
+      h="full"
+      pl={3}
+      pr={1.5}
+      spacing={1.5}
+      cursor="pointer"
+      role="group"
+      bg={previewActive ? "surface.bg" : "transparent"}
+      color={previewActive ? "ink.base" : "ink.muted"}
+      borderRight="1px solid"
+      borderColor="surface.border"
+      borderTop="1px solid"
+      borderTopColor={previewActive && isFocused ? "brand.500" : "transparent"}
+      _hover={{ color: "ink.base", bg: previewActive ? "surface.bg" : "surface.hover" }}
+      transition="background 0.1s ease"
+      onClick={() => setView("preview")}
+    >
+      <Icon as={VscOpenPreview} fontSize="14px" flexShrink={0} color="brand.400" />
+      <Text fontSize="13px" whiteSpace="nowrap">
+        Preview
+      </Text>
+      <Flex
+        boxSize="18px"
+        borderRadius="4px"
+        align="center"
+        justify="center"
+        flexShrink={0}
+        opacity={previewActive ? 0.9 : 0}
+        _groupHover={{ opacity: 0.9 }}
+        _hover={{ bg: "surface.hover", opacity: 1 }}
+        onClick={(e) => {
+          e.stopPropagation();
+          setPreview(false);
+          setView("editor");
+        }}
+      >
+        <Icon as={VscChromeClose} fontSize="13px" />
+      </Flex>
+    </HStack>
+  ) : null;
 
   return (
     <Flex
@@ -713,64 +794,76 @@ function EditorGroup({
         align="stretch"
         flexShrink={0}
       >
-        <Flex align="stretch" overflowX="auto" flex={1} minW={0} sx={{ "&::-webkit-scrollbar": { height: "0px" } }}>
+        <Flex
+          align="stretch"
+          overflowX="auto"
+          flex={1}
+          minW={0}
+          sx={{ "&::-webkit-scrollbar": { height: "0px" } }}
+          onDragOver={(e) => e.preventDefault()}
+          onDrop={stripDrop}
+        >
           {openFiles.map((f, i) => {
             const active = f.id === activeFileId && !settingsHere && !previewActive;
             const { icon: fIcon, color: fColor } = fileIcon(f.path);
             return (
-              <HStack
-                key={f.id}
-                draggable
-                onDragStart={(e: DragEvent) =>
-                  e.dataTransfer.setData("text/plain", JSON.stringify({ g: index, id: f.id }))
-                }
-                onDragOver={(e) => {
-                  e.preventDefault();
-                  e.stopPropagation();
-                }}
-                onDrop={(e) => tabDrop(e, i)}
-                h="full"
-                pl={3}
-                pr={1.5}
-                spacing={1.5}
-                cursor="pointer"
-                role="group"
-                bg={active ? "surface.bg" : "transparent"}
-                color={active ? "ink.base" : "ink.muted"}
-                borderRight="1px solid"
-                borderColor="surface.border"
-                borderTop="1px solid"
-                borderTopColor={active && isFocused ? "brand.500" : "transparent"}
-                _hover={{ color: "ink.base", bg: active ? "surface.bg" : "surface.hover" }}
-                transition="background 0.1s ease"
-                onClick={() => {
-                  setPreview(false);
-                  onSelectTab(f.id);
-                }}
-              >
-                <Icon as={fIcon} color={fColor} fontSize="14px" flexShrink={0} />
-                <Text fontSize="13px" whiteSpace="nowrap">
-                  {f.path.split("/").pop()}
-                </Text>
-                <Flex
-                  boxSize="18px"
-                  borderRadius="4px"
-                  align="center"
-                  justify="center"
-                  flexShrink={0}
-                  opacity={active ? 0.9 : 0}
-                  _groupHover={{ opacity: 0.9 }}
-                  _hover={{ bg: "surface.hover", opacity: 1 }}
-                  onClick={(e) => {
+              <Fragment key={f.id}>
+                {slot === i && previewTabEl}
+                <HStack
+                  draggable
+                  onDragStart={(e: DragEvent) =>
+                    e.dataTransfer.setData("text/plain", JSON.stringify({ g: index, id: f.id }))
+                  }
+                  onDragOver={(e) => {
+                    e.preventDefault();
                     e.stopPropagation();
-                    onCloseTab(f.id);
+                  }}
+                  onDrop={(e) => tabDrop(e, i)}
+                  h="full"
+                  pl={3}
+                  pr={1.5}
+                  spacing={1.5}
+                  cursor="pointer"
+                  role="group"
+                  bg={active ? "surface.bg" : "transparent"}
+                  color={active ? "ink.base" : "ink.muted"}
+                  borderRight="1px solid"
+                  borderColor="surface.border"
+                  borderTop="1px solid"
+                  borderTopColor={active && isFocused ? "brand.500" : "transparent"}
+                  _hover={{ color: "ink.base", bg: active ? "surface.bg" : "surface.hover" }}
+                  transition="background 0.1s ease"
+                  onClick={() => {
+                    setView("editor");
+                    onSelectTab(f.id);
                   }}
                 >
-                  <Icon as={VscChromeClose} fontSize="13px" />
-                </Flex>
-              </HStack>
+                  <Icon as={fIcon} color={fColor} fontSize="14px" flexShrink={0} />
+                  <Text fontSize="13px" whiteSpace="nowrap">
+                    {f.path.split("/").pop()}
+                  </Text>
+                  <Flex
+                    boxSize="18px"
+                    borderRadius="4px"
+                    align="center"
+                    justify="center"
+                    flexShrink={0}
+                    opacity={active ? 0.9 : 0}
+                    _groupHover={{ opacity: 0.9 }}
+                    _hover={{ bg: "surface.hover", opacity: 1 }}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onCloseTab(f.id);
+                    }}
+                  >
+                    <Icon as={VscChromeClose} fontSize="13px" />
+                  </Flex>
+                </HStack>
+              </Fragment>
             );
           })}
+
+          {slot >= openFiles.length && previewTabEl}
 
           {settingsHere && (
             <HStack
@@ -808,49 +901,12 @@ function EditorGroup({
               </Flex>
             </HStack>
           )}
-
-          {previewActive && (
-            <HStack
-              h="full"
-              pl={3}
-              pr={1.5}
-              spacing={1.5}
-              cursor="pointer"
-              role="group"
-              bg="surface.bg"
-              color="ink.base"
-              borderRight="1px solid"
-              borderColor="surface.border"
-              borderTop="1px solid"
-              borderTopColor={isFocused ? "brand.500" : "transparent"}
-            >
-              <Icon as={VscOpenPreview} fontSize="14px" flexShrink={0} color="brand.400" />
-              <Text fontSize="13px" whiteSpace="nowrap">
-                Preview
-              </Text>
-              <Flex
-                boxSize="18px"
-                borderRadius="4px"
-                align="center"
-                justify="center"
-                flexShrink={0}
-                opacity={0.9}
-                _hover={{ bg: "surface.hover", opacity: 1 }}
-                onClick={(e) => {
-                  e.stopPropagation();
-                  setPreview(false);
-                }}
-              >
-                <Icon as={VscChromeClose} fontSize="13px" />
-              </Flex>
-            </HStack>
-          )}
         </Flex>
 
-        {(isMarkdown || canSplit) && (
+        {(previewable || canSplit) && (
           <Flex align="center" gap={1} px={2} flexShrink={0} borderLeft="1px solid" borderColor="surface.border">
-            {isMarkdown && (
-              <Tooltip label={previewActive ? "Close preview" : "Open preview tab"} openDelay={300}>
+            {previewable && (
+              <Tooltip label={previewActive ? "Back to editor" : "Open preview tab"} openDelay={300}>
                 <Flex
                   boxSize="26px"
                   borderRadius="4px"
@@ -859,7 +915,15 @@ function EditorGroup({
                   cursor="pointer"
                   color={previewActive ? "brand.400" : "ink.muted"}
                   _hover={{ bg: "surface.hover", color: previewActive ? "brand.400" : "ink.base" }}
-                  onClick={() => setPreview((p) => !p)}
+                  onClick={() => {
+                    if (previewActive) {
+                      setView("editor"); // keep the tab, just show the editor
+                    } else {
+                      if (!preview) setPreviewPos(openFiles.length);
+                      setPreview(true);
+                      setView("preview");
+                    }
+                  }}
                 >
                   <Icon as={VscOpenPreview} fontSize="16px" />
                 </Flex>
@@ -908,7 +972,7 @@ function EditorGroup({
       </Box>
       {previewActive && (
         <Flex direction="column" flex={1} minH={0} minW={0}>
-          <MarkdownPreview text={mdText} />
+          {isHtml ? <HtmlPreview text={mdText} /> : <MarkdownPreview text={mdText} />}
         </Flex>
       )}
       {isBinary && activeFile && <BinaryView file={activeFile} canManage={canManage} />}

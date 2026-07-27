@@ -845,6 +845,68 @@ impl Database {
         Ok(rows)
     }
 
+    /// The latest message in a workspace: (id, author id, body, created_at).
+    pub async fn workspace_last_msg(&self, workspace_id: i64) -> Result<Option<(i64, i64, String, i64)>> {
+        Ok(sqlx::query_as(
+            r#"SELECT id, user_id, body, created_at FROM message
+               WHERE workspace_id = $1 ORDER BY id DESC LIMIT 1"#,
+        )
+        .bind(workspace_id)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    /// Count of workspace messages after `after` not sent by `me` (unread).
+    pub async fn ws_unread_count(&self, workspace_id: i64, me: i64, after: i64) -> Result<i64> {
+        let (n,): (i64,) = sqlx::query_as(
+            r#"SELECT COUNT(*) FROM message WHERE workspace_id = $1 AND id > $2 AND user_id <> $3"#,
+        )
+        .bind(workspace_id)
+        .bind(after)
+        .bind(me)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(n)
+    }
+
+    /// For each DM peer of `me`, the latest message: (peer, id, sender, body, created_at).
+    pub async fn dm_overview(&self, org_id: i64, me: i64) -> Result<Vec<(i64, i64, i64, String, i64)>> {
+        let rows: Vec<(i64, i64, i64, String, i64)> = sqlx::query_as(
+            r#"SELECT
+                 CASE WHEN d.sender_id = $2 THEN d.recipient_id ELSE d.sender_id END AS peer_id,
+                 d.id AS last_id,
+                 d.sender_id AS last_sender,
+                 d.body AS body,
+                 d.created_at AS created_at
+               FROM dm d
+               JOIN (
+                 SELECT MAX(id) AS mid FROM dm
+                 WHERE org_id = $1 AND (sender_id = $2 OR recipient_id = $2)
+                 GROUP BY (CASE WHEN sender_id = $2 THEN recipient_id ELSE sender_id END)
+               ) x ON d.id = x.mid"#,
+        )
+        .bind(org_id)
+        .bind(me)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Count of DMs from `peer` to `me` after `after` (unread from that peer).
+    pub async fn dm_unread_count(&self, org_id: i64, me: i64, peer: i64, after: i64) -> Result<i64> {
+        let (n,): (i64,) = sqlx::query_as(
+            r#"SELECT COUNT(*) FROM dm
+               WHERE org_id = $1 AND recipient_id = $2 AND sender_id = $3 AND id > $4"#,
+        )
+        .bind(org_id)
+        .bind(me)
+        .bind(peer)
+        .bind(after)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(n)
+    }
+
     /// Edit a group-chat message's body — only the author may do so. Returns
     /// true if a row was actually changed (false = not yours / not found).
     pub async fn edit_message(&self, id: i64, user_id: i64, body: &str, now: i64) -> Result<bool> {

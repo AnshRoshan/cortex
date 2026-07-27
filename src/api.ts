@@ -215,6 +215,37 @@ export async function toggleReaction(kind: "ws" | "dm", msgId: number, emoji: st
   await encFetch(`/api/reaction`, { method: "POST", body: { kind, msg_id: msgId, emoji } });
 }
 
+// ----- unread overview (per-thread summary for the sidebar) -----
+export type ThreadSummary = {
+  last_id: number;
+  last_sender: number;
+  body: string; // short preview
+  at: number;
+  unread: number;
+};
+export type ChatOverview = {
+  ws: ThreadSummary | null;
+  dms: ({ peer_id: number } & ThreadSummary)[];
+};
+// Sends the client's per-thread read markers so the server can count unread.
+// Payload carries message previews, so it's ECIES-sealed like the rest of chat.
+export async function getChatOverview(
+  workspaceId: number | null,
+  orgId: number | undefined,
+  read: Record<string, number>,
+): Promise<ChatOverview> {
+  const dm_read: Record<number, number> = {};
+  let ws_read: number | undefined;
+  for (const [k, v] of Object.entries(read)) {
+    if (k.startsWith("dm:")) dm_read[Number(k.slice(3))] = v;
+    else if (workspaceId != null && k === `ws:${workspaceId}`) ws_read = v;
+  }
+  return encFetch(`/api/chat/overview`, {
+    method: "POST",
+    body: { workspace_id: workspaceId ?? undefined, org: orgId, ws_read, dm_read },
+  });
+}
+
 // ----- audit log (admin / root only) -----
 export type AuditEntry = {
   id: number;

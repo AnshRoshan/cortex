@@ -86,6 +86,15 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
   const [changes, setChanges] = useState<SessionChange[]>([]);
   const [prompt, setPrompt] = useState<PromptCfg | null>(null);
   const [confirm, setConfirm] = useState<ConfirmCfg | null>(null);
+  // Unread tracking: poll the latest message id per thread and compare against
+  // per-thread "last read" markers (persisted). A thread the user is actively
+  // viewing is marked read automatically.
+  const [overview, setOverview] = useState<api.ChatOverview | null>(null);
+  const [read, setRead] = useLocalStorageState<Record<string, number>>("cortex-chat-read", { defaultValue: {} });
+  const readRef = useRef(read);
+  readRef.current = read;
+  const seeded = useRef(false);
+  const [presence, setPresence] = useState<Record<number, boolean>>({});
 
   const treeRef = useRef<FileTreeHandle>(null);
   const uploadInput = useRef<HTMLInputElement>(null);
@@ -116,6 +125,79 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, []);
+
+  // Poll the unread overview. On the very first load, seed markers to the
+  // current latest so only messages that arrive afterwards count as unread.
+  useEffect(() => {
+    let stop = false;
+    const poll = async () => {
+      try {
+        const o = await api.getChatOverview(activeWsId, orgId, readRef.current);
+        if (stop) return;
+        setOverview(o);
+        if (!seeded.current) {
+          seeded.current = true;
+          setRead((prev) => {
+            const next = { ...prev };
+            if (o.ws && activeWsId != null && next[`ws:${activeWsId}`] == null) next[`ws:${activeWsId}`] = o.ws.last_id;
+            o.dms.forEach((d) => {
+              if (next[`dm:${d.peer_id}`] == null) next[`dm:${d.peer_id}`] = d.last_id;
+            });
+            return next;
+          });
+        }
+      } catch {
+        /* ignore */
+      }
+    };
+    poll();
+    const id = window.setInterval(poll, 5000);
+    return () => {
+      stop = true;
+      window.clearInterval(id);
+    };
+  }, [activeWsId, orgId, setRead]);
+
+  // The open thread is "read" up to its latest message.
+  useEffect(() => {
+    if (section !== "chat" || settingsOpen || !overview) return;
+    setRead((prev) => {
+      const next = { ...prev };
+      let changed = false;
+      const mark = (k: string, id: number) => {
+        if ((next[k] ?? 0) < id) {
+          next[k] = id;
+          changed = true;
+        }
+      };
+      if (chatTarget.kind === "ws" && activeWsId != null && overview.ws) mark(`ws:${activeWsId}`, overview.ws.last_id);
+      if (chatTarget.kind === "dm") {
+        const e = overview.dms.find((d) => d.peer_id === chatTarget.userId);
+        if (e) mark(`dm:${chatTarget.userId}`, e.last_id);
+      }
+      return changed ? next : prev;
+    });
+  }, [section, settingsOpen, chatTarget, overview, activeWsId, setRead]);
+
+  // Who's online, for presence dots in the chat sidebar.
+  useEffect(() => {
+    let stop = false;
+    const poll = async () => {
+      try {
+        const r = await api.getPresence(orgId);
+        if (!stop) setPresence(Object.fromEntries(r.presence.map((p) => [p.id, p.online])));
+      } catch {
+        /* ignore */
+      }
+    };
+    poll();
+    const id = window.setInterval(poll, 20000);
+    return () => {
+      stop = true;
+      window.clearInterval(id);
+    };
+  }, [orgId]);
+
   const uploadDir = useRef<string>("");
   const editorLike = section === "explorer" || section === "scm";
 
@@ -476,6 +558,38 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
 
   const canManage = true;
   const activeWs = org.workspaces.find((w) => w.id === activeWsId);
+
+  // Per-thread unread counts + last-message previews for the sidebar. The server
+  // already computed counts from our read markers; we zero out whatever thread is
+  // open right now (it's read the moment you look at it, before the next poll).
+  const myId = org.members.find((m) => m.email === me.email)?.id;
+  const memberName = (id: number) => {
+    const m = org.members.find((x) => x.id === id);
+    return m ? m.name || m.email : "";
+  };
+  const activeKey =
+    section === "chat" && !settingsOpen
+      ? chatTarget.kind === "ws"
+        ? `ws:${activeWsId}`
+        : `dm:${chatTarget.userId}`
+      : null;
+  const summaryPreview = (s: api.ThreadSummary, isWs: boolean) => {
+    const body = s.body?.startsWith("![") ? "📷 Photo" : s.body || "";
+    const fromMe = s.last_sender === myId;
+    const prefix = fromMe ? "You: " : isWs ? `${memberName(s.last_sender)}: ` : "";
+    return prefix + body;
+  };
+
+  const wsUnread = activeKey === `ws:${activeWsId}` ? 0 : overview?.ws?.unread ?? 0;
+  const wsPreview = overview?.ws ? summaryPreview(overview.ws, true) : undefined;
+  const dmUnread: Record<number, number> = {};
+  const dmPreview: Record<number, string> = {};
+  overview?.dms.forEach((d) => {
+    dmUnread[d.peer_id] = activeKey === `dm:${d.peer_id}` ? 0 : d.unread;
+    dmPreview[d.peer_id] = summaryPreview(d, false);
+  });
+  const chatUnreadCount = wsUnread + Object.values(dmUnread).reduce((a, b) => a + b, 0);
+
   const allFiles = ws?.files ?? [];
   const filesById = new Map(allFiles.map((f) => [f.id, f]));
   const focusedIdx = Math.min(focused, groups.length - 1);
@@ -546,6 +660,7 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
           }
         }}
         changeCount={changes.length}
+        chatCount={chatUnreadCount}
         me={me}
         onProfile={() => setSettingsOpen(true)}
         colorMode={colorMode}
@@ -596,6 +711,11 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
               members={org.members}
               target={chatTarget}
               onSelect={setChatTarget}
+              wsUnread={wsUnread}
+              dmUnread={dmUnread}
+              wsPreview={wsPreview}
+              dmPreview={dmPreview}
+              presence={presence}
             />
           </Flex>
         ) : (

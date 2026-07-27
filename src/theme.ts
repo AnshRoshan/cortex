@@ -51,14 +51,17 @@ const theme = extendTheme({
     },
   },
   shadows: {
-    outline: "0 0 0 2px rgba(107, 91, 255, 0.55)",
-    card: "0 1px 2px rgba(0,0,0,0.05), 0 6px 20px -14px rgba(0,0,0,0.25)",
-    pop: "0 10px 34px -14px rgba(0,0,0,0.3)",
+    xs: "0 1px 2px rgba(0,0,0,0.06)",
+    sm: "0 1px 3px rgba(0,0,0,0.09), 0 1px 2px rgba(0,0,0,0.05)",
+    outline: "0 0 0 3px rgba(107, 91, 255, 0.35)",
+    card: "0 1px 2px rgba(0,0,0,0.06), 0 8px 24px -16px rgba(0,0,0,0.35)",
+    pop: "0 12px 40px -12px rgba(0,0,0,0.45), 0 2px 8px -4px rgba(0,0,0,0.22)",
   },
   radii: {
-    md: "4px",
-    lg: "6px",
-    xl: "8px",
+    md: "7px",
+    lg: "10px",
+    xl: "14px",
+    "2xl": "18px",
   },
   styles: {
     global: {
@@ -86,7 +89,17 @@ const theme = extendTheme({
         fontWeight: 600,
         borderRadius: "lg",
         letterSpacing: "-0.01em",
+        transition: "background 0.12s ease, transform 0.06s ease",
         _focusVisible: { boxShadow: "outline" },
+        _active: { transform: "translateY(0.5px)" },
+      },
+      variants: {
+        // Quiet secondary action that reads clearly on panels.
+        subtle: {
+          bg: "surface.hover",
+          color: "ink.base",
+          _hover: { bg: "surface.borderStrong" },
+        },
       },
     },
     Input: {
@@ -96,8 +109,34 @@ const theme = extendTheme({
           field: {
             bg: "surface.raised",
             borderColor: "surface.border",
+            borderRadius: "lg",
             _hover: { borderColor: "surface.borderStrong" },
             _placeholder: { color: "ink.subtle" },
+          },
+        },
+      },
+    },
+    Textarea: {
+      defaultProps: { focusBorderColor: "brand.500" },
+      variants: {
+        outline: {
+          bg: "surface.raised",
+          borderColor: "surface.border",
+          borderRadius: "lg",
+          _hover: { borderColor: "surface.borderStrong" },
+          _placeholder: { color: "ink.subtle" },
+        },
+      },
+    },
+    Select: {
+      defaultProps: { focusBorderColor: "brand.500" },
+      variants: {
+        outline: {
+          field: {
+            bg: "surface.raised",
+            borderColor: "surface.border",
+            borderRadius: "lg",
+            _hover: { borderColor: "surface.borderStrong" },
           },
         },
       },
@@ -110,9 +149,91 @@ const theme = extendTheme({
         borderColor: "surface.border",
         borderRadius: "md",
         fontSize: "xs",
-        px: 2,
-        py: 1,
+        px: 2.5,
+        py: 1.5,
         boxShadow: "pop",
+      },
+    },
+    // Every dropdown menu (context menus, language picker, account menu…).
+    Menu: {
+      baseStyle: {
+        list: {
+          bg: "surface.raised",
+          border: "1px solid",
+          borderColor: "surface.border",
+          borderRadius: "lg",
+          boxShadow: "pop",
+          py: 1,
+          minW: "184px",
+        },
+        item: {
+          bg: "transparent",
+          color: "ink.base",
+          fontSize: "sm",
+          borderRadius: "md",
+          mx: 1,
+          px: 2.5,
+          py: 1.5,
+          _hover: { bg: "surface.hover" },
+          _focus: { bg: "surface.hover" },
+        },
+        divider: { borderColor: "surface.border", my: 1 },
+        groupTitle: {
+          fontSize: "11px",
+          fontWeight: 700,
+          textTransform: "uppercase",
+          letterSpacing: "0.05em",
+          color: "ink.subtle",
+          mx: 3,
+        },
+      },
+    },
+    // AlertDialog shares this component key, so confirm/prompt dialogs get it too.
+    Modal: {
+      baseStyle: {
+        overlay: { bg: "blackAlpha.600", backdropFilter: "blur(5px)" },
+        dialog: {
+          bg: "surface.panel",
+          borderRadius: "xl",
+          border: "1px solid",
+          borderColor: "surface.border",
+          boxShadow: "pop",
+          mx: 4,
+        },
+        header: { fontSize: "md", fontWeight: 700, pb: 2 },
+        closeButton: {
+          borderRadius: "md",
+          color: "ink.muted",
+          _hover: { bg: "surface.hover", color: "ink.base" },
+        },
+      },
+    },
+    Popover: {
+      baseStyle: {
+        content: {
+          bg: "surface.raised",
+          border: "1px solid",
+          borderColor: "surface.border",
+          borderRadius: "lg",
+          boxShadow: "pop",
+          _focusVisible: { outline: "none", boxShadow: "pop" },
+        },
+      },
+    },
+    Drawer: {
+      baseStyle: {
+        overlay: { bg: "blackAlpha.600", backdropFilter: "blur(5px)" },
+        dialog: { bg: "surface.panel" },
+      },
+    },
+    Card: {
+      baseStyle: {
+        container: {
+          bg: "surface.panel",
+          borderRadius: "xl",
+          border: "1px solid",
+          borderColor: "surface.border",
+        },
       },
     },
     Tabs: { defaultProps: { colorScheme: "brand" } },

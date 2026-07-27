@@ -12,6 +12,11 @@ type Props = {
   members: Member[];
   target: ChatTarget;
   onSelect: (t: ChatTarget) => void;
+  wsUnread?: number;
+  dmUnread?: Record<number, number>;
+  wsPreview?: string;
+  dmPreview?: Record<number, string>;
+  presence?: Record<number, boolean>;
 };
 
 function Row({
@@ -21,6 +26,8 @@ function Row({
   icon,
   avatarName,
   badge,
+  unread = 0,
+  online,
   onClick,
 }: {
   active: boolean;
@@ -29,30 +36,48 @@ function Row({
   icon?: typeof VscComment;
   avatarName?: string;
   badge?: string;
+  unread?: number;
+  online?: boolean; // undefined => no presence dot (e.g. the group channel)
   onClick: () => void;
 }) {
+  const strong = active || unread > 0;
   return (
     <HStack
       px={2.5}
-      py={1.5}
+      py={2}
       mx={2}
       spacing={2.5}
-      borderRadius="md"
+      borderRadius="lg"
       cursor="pointer"
       bg={active ? "accent.tint" : "transparent"}
       _hover={{ bg: active ? "accent.tint" : "surface.hover" }}
       onClick={onClick}
     >
       {icon ? (
-        <Center boxSize="26px" borderRadius="6px" bg="surface.hover" color="ink.muted" flexShrink={0}>
-          <Icon as={icon} fontSize="14px" />
+        <Center boxSize="34px" borderRadius="lg" bg="surface.hover" color="ink.muted" flexShrink={0}>
+          <Icon as={icon} fontSize="16px" />
         </Center>
       ) : (
-        <Avatar size="xs" name={avatarName} bg="brand.600" color="white" />
+        <Box position="relative" flexShrink={0}>
+          <Avatar size="sm" boxSize="34px" name={avatarName} bg="brand.600" color="white" />
+          {online !== undefined && (
+            <Box
+              position="absolute"
+              bottom="-1px"
+              right="-1px"
+              boxSize="11px"
+              borderRadius="full"
+              bg={online ? "green.400" : "surface.borderStrong"}
+              border="2px solid"
+              borderColor="surface.panel"
+              title={online ? "Online" : "Offline"}
+            />
+          )}
+        </Box>
       )}
       <Box minW={0} flex={1}>
         <HStack spacing={1.5}>
-          <Text fontSize="sm" color={active ? "ink.base" : "ink.muted"} fontWeight={active ? 600 : 400} isTruncated>
+          <Text fontSize="sm" fontWeight={strong ? 600 : 500} color={strong ? "ink.base" : "ink.muted"} isTruncated>
             {label}
           </Text>
           {badge && (
@@ -62,11 +87,26 @@ function Row({
           )}
         </HStack>
         {sub && (
-          <Text fontSize="xs" color="ink.subtle" isTruncated>
+          <Text fontSize="xs" color={unread > 0 ? "ink.muted" : "ink.subtle"} isTruncated>
             {sub}
           </Text>
         )}
       </Box>
+      {unread > 0 && !active && (
+        <Center
+          minW="20px"
+          h="20px"
+          px="6px"
+          borderRadius="full"
+          bg="brand.500"
+          color="white"
+          fontSize="11px"
+          fontWeight={700}
+          flexShrink={0}
+        >
+          {unread > 99 ? "99+" : unread}
+        </Center>
+      )}
     </HStack>
   );
 }
@@ -79,7 +119,7 @@ function Label({ children }: { children: string }) {
   );
 }
 
-function ChatChannels({ me, workspaceId, members, target, onSelect }: Props) {
+function ChatChannels({ me, workspaceId, members, target, onSelect, wsUnread, dmUnread, wsPreview, dmPreview, presence }: Props) {
   const peers = useMemo(() => members.filter((m) => m.email !== me.email), [members, me.email]);
 
   return (
@@ -91,7 +131,8 @@ function ChatChannels({ me, workspaceId, members, target, onSelect }: Props) {
             active={target.kind === "ws"}
             icon={VscComment}
             label="Workspace"
-            sub="Group chat"
+            sub={wsPreview || "Group chat"}
+            unread={wsUnread}
             onClick={() => onSelect({ kind: "ws" })}
           />
         </>
@@ -105,8 +146,10 @@ function ChatChannels({ me, workspaceId, members, target, onSelect }: Props) {
             active={target.kind === "dm" && target.userId === p.id}
             avatarName={p.name || p.email}
             label={p.name || p.email}
-            sub={p.name ? p.email : undefined}
+            sub={dmPreview?.[p.id]}
             badge={p.role === "admin" ? "admin" : undefined}
+            unread={dmUnread?.[p.id]}
+            online={presence?.[p.id] ?? false}
             onClick={() => onSelect({ kind: "dm", userId: p.id })}
           />
         ))}

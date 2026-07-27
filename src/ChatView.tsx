@@ -15,7 +15,7 @@ import {
   Tooltip,
   useToast,
 } from "@chakra-ui/react";
-import { ChangeEvent, ClipboardEvent, FormEvent, KeyboardEvent, MouseEvent as ReactMouseEvent, useCallback, useEffect, useRef, useState } from "react";
+import { ChangeEvent, ClipboardEvent, FormEvent, Fragment, KeyboardEvent, MouseEvent as ReactMouseEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { FiSmile } from "react-icons/fi";
 import { VscCheck, VscClearAll, VscClose, VscComment, VscCopy, VscEdit, VscSend, VscTrash } from "react-icons/vsc";
 import ReactMarkdown from "react-markdown";
@@ -41,6 +41,56 @@ function hueOf(s: string) {
   let h = 0;
   for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) % 360;
   return h;
+}
+
+function escapeRegex(s: string) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+// A rehype plugin that finds known @mentions in the rendered text and wraps them
+// in <span class="mention"> (or "mention mention-me" when they name the viewer),
+// so they can be coloured. Matching is against the real member list — names can
+// contain spaces, so we can't detect mentions with a generic regex.
+function makeMentionPlugin(tokens: string[], mine: Set<string>) {
+  if (tokens.length === 0) return null;
+  const re = new RegExp("@(" + tokens.map(escapeRegex).join("|") + ")\\b", "gi");
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const split = (value: string): any[] => {
+    const out: any[] = []; // eslint-disable-line @typescript-eslint/no-explicit-any
+    let last = 0;
+    let m: RegExpExecArray | null;
+    re.lastIndex = 0;
+    while ((m = re.exec(value))) {
+      if (m.index > last) out.push({ type: "text", value: value.slice(last, m.index) });
+      const isMe = mine.has(m[1].toLowerCase());
+      out.push({
+        type: "element",
+        tagName: "span",
+        properties: { className: isMe ? ["mention", "mention-me"] : ["mention"] },
+        children: [{ type: "text", value: m[0] }],
+      });
+      last = m.index + m[0].length;
+    }
+    if (last < value.length) out.push({ type: "text", value: value.slice(last) });
+    return out;
+  };
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const walk = (node: any) => {
+    if (!Array.isArray(node.children)) return;
+    const next: any[] = []; // eslint-disable-line @typescript-eslint/no-explicit-any
+    for (const c of node.children) {
+      if (c.type === "text" && c.value.includes("@")) {
+        next.push(...split(c.value));
+      } else {
+        // Don't rewrite inside code spans, code blocks or links.
+        if (!(c.tagName === "code" || c.tagName === "pre" || c.tagName === "a")) walk(c);
+        next.push(c);
+      }
+    }
+    node.children = next;
+  };
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  return () => (tree: any) => walk(tree);
 }
 
 // Hover emoji picker. Box buttons (not MenuItem) render the emoji row reliably.
@@ -86,9 +136,33 @@ function timeOf(unix: number) {
   return new Date(unix * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
+function sameDay(a: number, b: number) {
+  return new Date(a * 1000).toDateString() === new Date(b * 1000).toDateString();
+}
+
+// "Today" / "Yesterday" / "12 March 2025" for the centered date dividers.
+function dayLabel(unix: number) {
+  const d = new Date(unix * 1000);
+  const today = new Date();
+  const yst = new Date();
+  yst.setDate(today.getDate() - 1);
+  if (d.toDateString() === today.toDateString()) return "Today";
+  if (d.toDateString() === yst.toDateString()) return "Yesterday";
+  return d.toLocaleDateString([], { day: "numeric", month: "long", year: "numeric" });
+}
+
+// A cheap fingerprint of every message's reactions, so a react/unreact (mine or
+// anyone's) is detected by the poll — without it, reactions only appeared after
+// a full refresh.
+function reactionSig(list: ChatMessage[]) {
+  return list
+    .map((m) => `${m.id}:${(m.reactions ?? []).map((r) => `${r.emoji}${r.count}${r.mine ? "*" : ""}`).join(",")}`)
+    .join("|");
+}
+
 // Only replace state when the thread actually changed — avoids the 2.5s poll
 // re-rendering (and flickering) an unchanged list. Also compares edited_at so
-// an in-place edit from someone else shows up.
+// an in-place edit from someone else shows up, and reactions so they appear live.
 function sameThread(a: ChatMessage[], b: ChatMessage[]) {
   if (a.length !== b.length) return false;
   if (a.length === 0) return true;
@@ -98,7 +172,8 @@ function sameThread(a: ChatMessage[], b: ChatMessage[]) {
     a[0].id === b[0].id &&
     la.id === lb.id &&
     la.body === lb.body &&
-    la.edited_at === lb.edited_at
+    la.edited_at === lb.edited_at &&
+    reactionSig(a) === reactionSig(b)
   );
 }
 
@@ -371,6 +446,20 @@ function ChatView({ me, orgId, workspaceId, members, isAdmin, target }: Props) {
   const mentionsMe = (body: string) =>
     (!!me.name && body.includes(`@${me.name}`)) || body.includes(`@${emailLocal}`);
 
+  // Colour every known @mention in message bodies (and flag ones that name me).
+  const mentionPlugin = useMemo(() => {
+    const names = [
+      ...members.map((m) => m.name).filter(Boolean),
+      ...members.map((m) => m.email.split("@")[0]),
+      me.name,
+      emailLocal,
+    ].filter(Boolean) as string[];
+    const tokens = Array.from(new Set(names)).sort((a, b) => b.length - a.length); // longest first
+    const mine = new Set([me.name, emailLocal].filter(Boolean).map((s) => (s as string).toLowerCase()));
+    return makeMentionPlugin(tokens, mine);
+  }, [members, me.name, emailLocal]);
+  const rehypePlugins = mentionPlugin ? [mentionPlugin] : [];
+
   const title = target.kind === "ws" ? "Workspace" : peer ? peer.name || peer.email : "Direct message";
   const peerPresence = peer ? presence[peer.id] : undefined;
   const subtitle =
@@ -392,14 +481,31 @@ function ChatView({ me, orgId, workspaceId, members, isAdmin, target }: Props) {
   return (
     <Flex flex={1} minW={0} direction="column" bg="surface.bg" overflow="hidden">
       <Flex align="center" justify="space-between" px={5} h={14} borderBottom="1px solid" borderColor="surface.border" flexShrink={0}>
-        <Box minW={0}>
-          <Text fontSize="md" fontWeight="semibold" color="ink.base" isTruncated>
-            {title}
-          </Text>
-          <Text fontSize="xs" color="ink.subtle" isTruncated>
-            {subtitle}
-          </Text>
-        </Box>
+        <Flex align="center" gap={2.5} minW={0}>
+          {peer && (
+            <Box position="relative" flexShrink={0}>
+              <Avatar size="sm" boxSize="34px" name={peer.name || peer.email} bg="brand.600" color="white" />
+              <Box
+                position="absolute"
+                bottom="-1px"
+                right="-1px"
+                boxSize="11px"
+                borderRadius="full"
+                bg={peerPresence?.online ? "green.400" : "surface.borderStrong"}
+                border="2px solid"
+                borderColor="surface.bg"
+              />
+            </Box>
+          )}
+          <Box minW={0}>
+            <Text fontSize="md" fontWeight="semibold" color="ink.base" isTruncated>
+              {title}
+            </Text>
+            <Text fontSize="xs" color={peerPresence?.online ? "green.400" : "ink.subtle"} isTruncated>
+              {subtitle}
+            </Text>
+          </Box>
+        </Flex>
         {/* Always reserve the slot so showing/hiding it never reflows the header. */}
         <Tooltip label={target.kind === "ws" ? "Clear workspace chat (admin)" : "Clear conversation for both"}>
           <IconButton
@@ -417,18 +523,39 @@ function ChatView({ me, orgId, workspaceId, members, isAdmin, target }: Props) {
         </Tooltip>
       </Flex>
 
-      <Box flex={1} minH={0} overflowY="auto" px={4} py={4}>
+      <Box
+        flex={1}
+        minH={0}
+        overflowY="auto"
+        px={{ base: 3, md: 6 }}
+        py={4}
+        sx={{
+          // Faint dotted "wallpaper" so bubbles read against the panel.
+          backgroundImage: "radial-gradient(var(--chakra-colors-surface-border) 0.5px, transparent 0.5px)",
+          backgroundSize: "20px 20px",
+        }}
+      >
         {messages.length === 0 ? (
           <Center flexDirection="column" gap={3} py={20} color="ink.muted">
             <Icon as={VscComment} fontSize="3xl" color="ink.subtle" />
             <Text fontSize="sm">{canSend ? "No messages yet. Say hello 👋" : "Pick a conversation to start."}</Text>
           </Center>
         ) : (
-          <Flex direction="column" gap={3}>
-            {messages.map((m) => {
+          <Flex direction="column">
+            {messages.map((m, i) => {
               const mine = m.email === me.email;
               const label = m.author || m.email;
               const callsMe = !mine && mentionsMe(m.body);
+              const prev = messages[i - 1];
+              const newDay = !prev || !sameDay(prev.created_at, m.created_at);
+              // Group consecutive messages from the same author (within 5 min, same
+              // day): hide the repeated avatar/name and tighten spacing, WhatsApp-style.
+              const grouped =
+                !!prev && !newDay && prev.email === m.email && m.created_at - prev.created_at < 300;
+              // The timestamp sits bottom-right; reserve room on the last text line
+              // for it with an inline spacer so it doesn't overlap the message.
+              const metaText = `${m.edited_at ? "edited · " : ""}${timeOf(m.created_at)}`;
+              const metaW = Math.round(metaText.length * 5.6 + 10);
 
               const actions = (
                 <HStack
@@ -467,43 +594,87 @@ function ChatView({ me, orgId, workspaceId, members, isAdmin, target }: Props) {
               );
 
               const bubble = (
-                <Box maxW={{ base: "78%", md: "64%" }} minW={0}>
-                  {!mine && (
-                    <Text fontSize="xs" fontWeight={600} color="ink.muted" mb={1} ml={1}>
-                      {label}
-                    </Text>
-                  )}
+                <Box maxW={{ base: "82%", md: "68%" }} minW={0}>
                   <Box
+                    position="relative"
                     bg={mine ? "brand.500" : "surface.raised"}
                     color={mine ? "white" : "ink.base"}
                     border={mine ? undefined : "1px solid"}
                     borderColor={callsMe ? "brand.400" : "surface.border"}
-                    boxShadow={callsMe ? "0 0 0 1px var(--chakra-colors-brand-400)" : undefined}
-                    borderRadius="16px"
-                    borderBottomRightRadius={mine ? "5px" : "16px"}
-                    borderBottomLeftRadius={mine ? "16px" : "5px"}
-                    px={3.5}
-                    py={2}
-                    fontSize="sm"
-                    sx={mdSx}
+                    boxShadow={callsMe ? "0 0 0 1px var(--chakra-colors-brand-400)" : "0 1px 1px rgba(0,0,0,0.14)"}
+                    borderRadius="12px"
+                    borderTopRightRadius={mine && !grouped ? "3px" : "12px"}
+                    borderTopLeftRadius={!mine && !grouped ? "3px" : "12px"}
+                    px="9px"
+                    py="6px"
+                    fontSize="14px"
                   >
-                    <ReactMarkdown remarkPlugins={[remarkGfm]}>{m.body}</ReactMarkdown>
+                    {!mine && !grouped && (
+                      <Text fontSize="xs" fontWeight={700} mb="1px" color={`hsl(${hueOf(m.email)}, 60%, 62%)`} isTruncated>
+                        {label}
+                      </Text>
+                    )}
+                    <Box
+                      sx={{
+                        ...mdSx,
+                        "& > p": { display: "inline" },
+                        "& .mention": {
+                          fontWeight: 700,
+                          color: mine ? "white" : "var(--chakra-colors-brand-300)",
+                        },
+                        "& .mention-me": {
+                          bg: mine ? "whiteAlpha.300" : "var(--chakra-colors-accent-tint)",
+                          borderRadius: "4px",
+                          px: "3px",
+                        },
+                      }}
+                    >
+                      <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={rehypePlugins}>
+                        {m.body}
+                      </ReactMarkdown>
+                      {/* inline spacer holding room for the absolutely-placed time */}
+                      <Box as="span" display="inline-block" w={`${metaW}px`} aria-hidden />
+                    </Box>
+                    <Text
+                      position="absolute"
+                      bottom="5px"
+                      right="9px"
+                      fontSize="10px"
+                      lineHeight="1"
+                      whiteSpace="nowrap"
+                      color={mine ? "whiteAlpha.800" : "ink.subtle"}
+                    >
+                      {metaText}
+                    </Text>
                   </Box>
                   {m.reactions && m.reactions.length > 0 && (
-                    <HStack spacing={1} mt={1.5} flexWrap="wrap" justify={mine ? "flex-end" : "flex-start"}>
+                    <HStack
+                      spacing={1}
+                      mt="-6px"
+                      ml={mine ? "auto" : "6px"}
+                      w="fit-content"
+                      flexWrap="wrap"
+                      justify={mine ? "flex-end" : "flex-start"}
+                      position="relative"
+                      zIndex={1}
+                    >
                       {m.reactions.map((r) => (
                         <Button
                           key={r.emoji}
                           size="xs"
-                          h="22px"
+                          h="20px"
                           minW="auto"
-                          px={2}
+                          px={1.5}
                           borderRadius="full"
-                          variant="outline"
+                          variant="solid"
+                          border="1px solid"
                           borderColor={r.mine ? "brand.400" : "surface.border"}
-                          bg={r.mine ? "surface.hover" : "surface.panel"}
+                          bg="surface.panel"
                           color="ink.base"
                           fontWeight={500}
+                          fontSize="11px"
+                          boxShadow="0 1px 2px rgba(0,0,0,0.15)"
+                          _hover={{ bg: "surface.hover" }}
                           onClick={() => react(m.id, r.emoji)}
                         >
                           {r.emoji} {r.count}
@@ -511,38 +682,65 @@ function ChatView({ me, orgId, workspaceId, members, isAdmin, target }: Props) {
                       ))}
                     </HStack>
                   )}
-                  <Text fontSize="10px" color="ink.subtle" mt={1} textAlign={mine ? "right" : "left"} px={1}>
-                    {timeOf(m.created_at)}
-                    {m.edited_at ? " · edited" : ""}
-                  </Text>
                 </Box>
               );
 
               return (
-                <Flex key={m.id} role="group" gap={2} align="flex-end" justify={mine ? "flex-end" : "flex-start"}>
-                  {mine ? (
-                    <>
-                      {actions}
-                      {bubble}
-                    </>
-                  ) : (
-                    <>
-                      <Avatar
-                        size="xs"
-                        name={label}
-                        bg={`hsl(${hueOf(m.email)}, 45%, 45%)`}
-                        color="white"
-                        flexShrink={0}
-                      />
-                      {bubble}
-                      {actions}
-                    </>
+                <Fragment key={m.id}>
+                  {newDay && (
+                    <Center my={4}>
+                      <Text
+                        px={3}
+                        py={1}
+                        fontSize="11px"
+                        fontWeight={600}
+                        color="ink.muted"
+                        bg="surface.raised"
+                        border="1px solid"
+                        borderColor="surface.border"
+                        borderRadius="full"
+                        boxShadow="xs"
+                      >
+                        {dayLabel(m.created_at)}
+                      </Text>
+                    </Center>
                   )}
-                </Flex>
+                  <Flex
+                    role="group"
+                    gap={2}
+                    align="flex-start"
+                    justify={mine ? "flex-end" : "flex-start"}
+                    mt={grouped ? "2px" : "10px"}
+                  >
+                    {mine ? (
+                      <>
+                        {actions}
+                        {bubble}
+                      </>
+                    ) : (
+                      <>
+                        {grouped ? (
+                          <Box w="28px" flexShrink={0} />
+                        ) : (
+                          <Avatar
+                            size="sm"
+                            boxSize="28px"
+                            name={label}
+                            bg={`hsl(${hueOf(m.email)}, 45%, 45%)`}
+                            color="white"
+                            flexShrink={0}
+                          />
+                        )}
+                        {bubble}
+                        {actions}
+                      </>
+                    )}
+                  </Flex>
+                </Fragment>
               );
             })}
             {typingNames.length > 0 && (
-              <Text fontSize="xs" color="ink.subtle" fontStyle="italic" ml={1}>
+              <Text fontSize="xs" color="ink.subtle" fontStyle="italic" ml={1} mt={2}>
                 {typingNames.join(", ")} {typingNames.length === 1 ? "is" : "are"} typing…
               </Text>
             )}

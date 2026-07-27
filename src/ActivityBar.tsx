@@ -34,6 +34,7 @@ type Props = {
   section: Section;
   onSelect: (s: Section) => void;
   changeCount: number;
+  chatCount?: number;
   me: Me;
   onProfile: () => void;
   colorMode: string;
@@ -46,6 +47,7 @@ function ActivityBar({
   section,
   onSelect,
   changeCount,
+  chatCount = 0,
   me,
   onProfile,
   colorMode,
@@ -56,7 +58,7 @@ function ActivityBar({
   const items: Item[] = [
     { key: "explorer", icon: VscFiles, label: "Explorer" },
     { key: "scm", icon: VscSourceControl, label: "Source Control", count: changeCount },
-    { key: "chat", icon: VscComment, label: "Chat" },
+    { key: "chat", icon: VscComment, label: "Chat", count: chatCount },
   ];
 
   return (
