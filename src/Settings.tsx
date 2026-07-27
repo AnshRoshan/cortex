@@ -732,7 +732,32 @@ function ProviderForm({
   const [model, setModel] = useState(initial?.model ?? "");
   const [key, setKey] = useState("");
   const [saving, setSaving] = useState(false);
+  const [testing, setTesting] = useState(false);
   const hasKey = !!initial?.has_key;
+
+  async function test() {
+    if (!model.trim()) return;
+    setTesting(true);
+    try {
+      const r = await api.testAiProvider({
+        scope,
+        provider,
+        base_url: baseUrl.trim() || undefined,
+        model: model.trim(),
+        key: key.trim() || undefined,
+      });
+      toast({
+        title: "Connection OK",
+        description: r.reply ? `Model replied: ${r.reply}` : "The provider accepted the request.",
+        status: "success",
+        duration: 4000,
+      });
+    } catch (err) {
+      fail(toast, err);
+    } finally {
+      setTesting(false);
+    }
+  }
 
   async function save(e: FormEvent) {
     e.preventDefault();
@@ -814,6 +839,16 @@ function ProviderForm({
         <HStack>
           <Button size="sm" type="submit" isLoading={saving} isDisabled={!storageReady || !model.trim() || (!hasKey && !key.trim())}>
             Save
+          </Button>
+          <Button
+            size="sm"
+            type="button"
+            variant="outline"
+            onClick={test}
+            isLoading={testing}
+            isDisabled={!model.trim() || (!hasKey && !key.trim())}
+          >
+            Test connection
           </Button>
           {(hasKey || initial) && (
             <Button size="sm" variant="ghost" color="red.400" onClick={clear}>

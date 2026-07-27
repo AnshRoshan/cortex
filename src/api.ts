@@ -253,6 +253,18 @@ export async function saveAiProvider(body: {
 export async function deleteAiProvider(scope: "user" | "org"): Promise<void> {
   await json(await fetch(`/api/ai/providers?scope=${scope}`, opts("DELETE")));
 }
+// Fire a real completion at this config from the backend to verify it works.
+// Throws with the provider's error message on failure. `key` may be omitted to
+// test the already-saved key. The browser never calls the AI provider directly.
+export async function testAiProvider(body: {
+  scope: "user" | "org";
+  provider: AiProviderKind;
+  base_url?: string;
+  model: string;
+  key?: string;
+}): Promise<{ ok: boolean; reply: string }> {
+  return json(await fetch("/api/ai/test", opts("POST", body)));
+}
 
 // ----- storage stats (owner / admin) -----
 export type StorageStats = { db_bytes: number; blob_bytes: number; tables: { name: string; rows: number }[] };

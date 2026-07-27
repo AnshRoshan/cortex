@@ -462,6 +462,15 @@ pub fn routes(db: Database) -> impl Filter<Extract = (impl Reply,), Error = Reje
         .and(warp::query::<ProviderScope>())
         .and_then(delete_ai_provider);
 
+    // Fire a one-shot completion at the given config to check it actually works.
+    // The provider call happens here in the backend — the browser never touches it.
+    let ai_test_r = warp::path!("ai" / "test")
+        .and(warp::post())
+        .and(with_auth(db.clone()))
+        .and(with_db(db.clone()))
+        .and(warp::body::json())
+        .and_then(test_ai_provider);
+
     let storage_r = warp::path!("admin" / "storage")
         .and(warp::get())
         .and(with_auth(db.clone()))
@@ -473,6 +482,7 @@ pub fn routes(db: Database) -> impl Filter<Extract = (impl Reply,), Error = Reje
         .or(ai_settings_r)
         .or(ai_set_r)
         .or(ai_del_r)
+        .or(ai_test_r)
         .or(storage_r)
         .boxed();
 
@@ -883,6 +893,103 @@ fn trim_url(base: &str) -> &str {
     base.trim().trim_end_matches('/')
 }
 
+/// Truncate a provider's raw error body so we surface a useful hint without
+/// dumping an entire HTML error page into the response.
+fn short_detail(s: &str) -> String {
+    let t = s.trim();
+    let short: String = t.chars().take(300).collect();
+    if short.len() < t.len() { format!("{}…", short) } else { short }
+}
+
+/// One completion call to a resolved provider. `Ok(reply_text)` on HTTP 200,
+/// `Err(user_facing_detail)` otherwise. All provider HTTP happens here — this is
+/// the single place outbound AI calls are made, shared by chat and test.
+async fn provider_complete(
+    prov: &ResolvedProvider,
+    system: &str,
+    msgs: &[serde_json::Value],
+    max_tokens: u32,
+) -> Result<String, String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .map_err(|_| "AI client init failed".to_string())?;
+
+    // "openai" and "azure" share the Chat Completions wire format; only the URL
+    // and auth header differ.
+    let openai_style = prov.provider == "openai" || prov.provider == "azure";
+
+    let req = if openai_style {
+        let mut oai_msgs = vec![json!({ "role": "system", "content": system })];
+        oai_msgs.extend(msgs.iter().cloned());
+        // Newer OpenAI reasoning models (o-series, gpt-5) reject `max_tokens` and
+        // require `max_completion_tokens`; everything else uses `max_tokens`.
+        let m = prov.model.to_lowercase();
+        let token_key = if m.starts_with("o1") || m.starts_with("o3") || m.starts_with("o4") || m.starts_with("gpt-5") {
+            "max_completion_tokens"
+        } else {
+            "max_tokens"
+        };
+        let mut body = json!({ "model": prov.model, "messages": oai_msgs });
+        body[token_key] = json!(max_tokens);
+
+        if prov.provider == "azure" {
+            // Azure: full deployment base in base_url, `api-key` header, api-version query.
+            let base = match prov.base_url.as_deref() {
+                Some(b) if !b.trim().is_empty() => trim_url(b),
+                _ => return Err("Azure needs the deployment base URL".to_string()),
+            };
+            client
+                .post(format!("{}/chat/completions?api-version=2024-10-21", base))
+                .header("api-key", prov.api_key.clone())
+                .json(&body)
+        } else {
+            let base = prov.base_url.as_deref().map(trim_url).unwrap_or("https://api.openai.com/v1");
+            client
+                .post(format!("{}/chat/completions", base))
+                .header("authorization", format!("Bearer {}", prov.api_key))
+                .json(&body)
+        }
+    } else {
+        let base = prov.base_url.as_deref().map(trim_url).unwrap_or("https://api.anthropic.com");
+        client
+            .post(format!("{}/v1/messages", base))
+            .header("x-api-key", prov.api_key.clone())
+            .header("anthropic-version", "2023-06-01")
+            .json(&json!({ "model": prov.model, "max_tokens": max_tokens, "system": system, "messages": msgs }))
+    };
+
+    let resp = req
+        .header("content-type", "application/json")
+        .send()
+        .await
+        .map_err(|_| "could not reach the AI service".to_string())?;
+    if !resp.status().is_success() {
+        let code = resp.status();
+        let detail = resp.text().await.unwrap_or_default();
+        log::warn!("AI provider error {}: {}", code, detail);
+        return Err(format!("provider returned {} — {}", code.as_u16(), short_detail(&detail)));
+    }
+    let val: serde_json::Value = resp.json().await.map_err(|_| "bad AI response".to_string())?;
+
+    let reply = if openai_style {
+        val.pointer("/choices/0/message/content").and_then(|v| v.as_str()).unwrap_or_default().to_string()
+    } else {
+        val.get("content")
+            .and_then(|c| c.as_array())
+            .map(|blocks| {
+                blocks
+                    .iter()
+                    .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
+                    .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                    .collect::<Vec<_>>()
+                    .join("")
+            })
+            .unwrap_or_default()
+    };
+    Ok(reply)
+}
+
 /// AI assistant grounded in the workspace's text files. Calls the resolved
 /// provider (Anthropic Messages API or any OpenAI-compatible chat endpoint) over
 /// raw HTTPS. Keys stay server-side — never sent to the browser.
@@ -914,87 +1021,9 @@ async fn ai_chat(user: User, db: Database, body: AiChatReq) -> Result<impl Reply
         return Ok(err(StatusCode::BAD_REQUEST, "no message"));
     }
 
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
-        .build()
-    {
-        Ok(c) => c,
-        Err(_) => return Ok(err(StatusCode::INTERNAL_SERVER_ERROR, "AI client init failed")),
-    };
-
-    // "openai" and "azure" share the Chat Completions wire format; only the URL
-    // and auth header differ.
-    let openai_style = prov.provider == "openai" || prov.provider == "azure";
-
-    let req = if openai_style {
-        let mut oai_msgs = vec![json!({ "role": "system", "content": system })];
-        oai_msgs.extend(msgs.iter().cloned());
-        // Newer OpenAI reasoning models (o-series, gpt-5) reject `max_tokens` and
-        // require `max_completion_tokens`; everything else uses `max_tokens`.
-        let m = prov.model.to_lowercase();
-        let token_key = if m.starts_with("o1") || m.starts_with("o3") || m.starts_with("o4") || m.starts_with("gpt-5") {
-            "max_completion_tokens"
-        } else {
-            "max_tokens"
-        };
-        let mut body = json!({ "model": prov.model, "messages": oai_msgs });
-        body[token_key] = json!(8192);
-
-        if prov.provider == "azure" {
-            // Azure: full deployment base in base_url, `api-key` header, api-version query.
-            let base = match prov.base_url.as_deref() {
-                Some(b) if !b.trim().is_empty() => trim_url(b),
-                _ => return Ok(err(StatusCode::BAD_REQUEST, "Azure needs the deployment base URL")),
-            };
-            client
-                .post(format!("{}/chat/completions?api-version=2024-10-21", base))
-                .header("api-key", prov.api_key.clone())
-                .json(&body)
-        } else {
-            let base = prov.base_url.as_deref().map(trim_url).unwrap_or("https://api.openai.com/v1");
-            client
-                .post(format!("{}/chat/completions", base))
-                .header("authorization", format!("Bearer {}", prov.api_key))
-                .json(&body)
-        }
-    } else {
-        let base = prov.base_url.as_deref().map(trim_url).unwrap_or("https://api.anthropic.com");
-        client
-            .post(format!("{}/v1/messages", base))
-            .header("x-api-key", prov.api_key.clone())
-            .header("anthropic-version", "2023-06-01")
-            .json(&json!({ "model": prov.model, "max_tokens": 8192, "system": system, "messages": msgs }))
-    };
-
-    let resp = match req.header("content-type", "application/json").send().await {
+    let reply = match provider_complete(&prov, &system, &msgs, 8192).await {
         Ok(r) => r,
-        Err(_) => return Ok(err(StatusCode::BAD_GATEWAY, "could not reach the AI service")),
-    };
-    if !resp.status().is_success() {
-        let code = resp.status();
-        let detail = resp.text().await.unwrap_or_default();
-        log::warn!("AI provider error {}: {}", code, detail);
-        return Ok(err(StatusCode::BAD_GATEWAY, "the AI service returned an error"));
-    }
-    let val: serde_json::Value = match resp.json().await {
-        Ok(v) => v,
-        Err(_) => return Ok(err(StatusCode::BAD_GATEWAY, "bad AI response")),
-    };
-
-    let reply = if openai_style {
-        val.pointer("/choices/0/message/content").and_then(|v| v.as_str()).unwrap_or_default().to_string()
-    } else {
-        val.get("content")
-            .and_then(|c| c.as_array())
-            .map(|blocks| {
-                blocks
-                    .iter()
-                    .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
-                    .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
-                    .collect::<Vec<_>>()
-                    .join("")
-            })
-            .unwrap_or_default()
+        Err(_) => return Ok(err(StatusCode::BAD_GATEWAY, "the AI service returned an error")),
     };
     let _ = db.audit(user.org_id, Some(user.id), "ai_chat", None, now_secs()).await;
     Ok(warp::reply::json(&json!({ "reply": reply, "source": prov.source })).into_response())
@@ -1119,6 +1148,63 @@ async fn delete_ai_provider(user: User, db: Database, q: ProviderScope) -> Resul
     };
     let _ = db.delete_provider(scope, scope_id).await;
     Ok(warp::reply::json(&json!({ "ok": true })).into_response())
+}
+
+/// Test a provider config by firing one real completion at it from the backend.
+/// Uses the key typed in the form if present, else the saved key for that scope,
+/// so "Test" works whether or not the user re-entered the key. Reports the real
+/// provider error on failure so the user can tell exactly what's wrong.
+async fn test_ai_provider(user: User, db: Database, body: ProviderBody) -> Result<impl Reply, Rejection> {
+    if !matches!(body.provider.as_str(), "anthropic" | "openai" | "azure") {
+        return Ok(err(StatusCode::BAD_REQUEST, "unknown provider"));
+    }
+    if body.model.trim().is_empty() {
+        return Ok(err(StatusCode::BAD_REQUEST, "model is required"));
+    }
+    let is_admin = user.role == "admin" || user.role == "root";
+    let (scope, scope_id) = match body.scope.as_str() {
+        "user" => ("user", user.id),
+        "org" => {
+            if !is_admin {
+                return Err(warp::reject::custom(Forbidden));
+            }
+            match user.org_id {
+                Some(o) => ("org", o),
+                None => return Ok(err(StatusCode::BAD_REQUEST, "no org")),
+            }
+        }
+        _ => return Ok(err(StatusCode::BAD_REQUEST, "bad scope")),
+    };
+
+    let api_key = match body.key.as_deref().map(str::trim).filter(|k| !k.is_empty()) {
+        Some(k) => k.to_string(),
+        None => match db
+            .get_provider(scope, scope_id)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|r| crypto::secret_decrypt(&r.key_cipher))
+        {
+            Some(k) => k,
+            None => return Ok(err(StatusCode::BAD_REQUEST, "Enter an API key to test.")),
+        },
+    };
+    let prov = ResolvedProvider {
+        provider: body.provider.clone(),
+        base_url: body.base_url.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string),
+        model: body.model.trim().to_string(),
+        api_key,
+        source: "test",
+    };
+
+    let msgs = vec![json!({ "role": "user", "content": "Reply with the single word: OK" })];
+    match provider_complete(&prov, "You are a connection test. Reply with exactly: OK", &msgs, 64).await {
+        Ok(reply) => {
+            let _ = db.audit(user.org_id, Some(user.id), "ai_provider_test", Some(scope), now_secs()).await;
+            Ok(warp::reply::json(&json!({ "ok": true, "reply": reply.trim() })).into_response())
+        }
+        Err(detail) => Ok(err(StatusCode::BAD_GATEWAY, &format!("Test failed — {}", detail))),
+    }
 }
 
 /// Owner/admin storage readout: DB file size, blob bytes, and per-table rows.

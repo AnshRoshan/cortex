@@ -13,7 +13,7 @@ COPY rustpad-wasm rustpad-wasm
 # corrupt crate. target/ is a cache mount (not in the image), so copy the binary
 # out in the same RUN. No tests here — deploy builds ship the binary; run
 # `cargo test` locally / in CI, not on the prod box.
-RUN --mount=type=cache,target=/home/rust/src/target \
+RUN --mount=type=cache,id=cargo-target-backend,target=/home/rust/src/target \
     cargo build --release \
     && cp target/release/rustpad-server /rustpad-server
 
@@ -25,7 +25,11 @@ COPY Cargo.toml Cargo.lock ./
 COPY rustpad-server rustpad-server
 COPY rustpad-wasm rustpad-wasm
 # pkg/ is written outside target/, so it survives the cached-target RUN.
-RUN --mount=type=cache,target=/home/rust/src/target \
+# Distinct cache id from the backend stage: the two stages build in parallel and
+# a shared target/ dir made them fight over a file lock and churn each other's
+# fingerprints, forcing a full recompile every time. Separate caches = each stays
+# warm and only changed crates rebuild.
+RUN --mount=type=cache,id=cargo-target-wasm,target=/home/rust/src/target \
     wasm-pack build rustpad-wasm
 
 FROM --platform=amd64 node:lts-alpine AS frontend
