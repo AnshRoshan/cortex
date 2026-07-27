@@ -83,6 +83,38 @@ leftover dev container). `docker image prune -f` deletes the now-dangling old
 images — without it, every `--build` grows disk until the small box fills up.
 Data survives rebuilds — it lives in the `cortex-data` volume.
 
+## Deploy via GitHub Actions + GHCR (recommended for a small box)
+
+Compiling Rust on a `t3.micro` (1 GB RAM) takes ~18 min and thrashes. Instead, let
+GitHub build the image and have EC2 only **pull** it. The workflow
+`.github/workflows/ci.yml` builds on every push to `main` and pushes to this repo's
+**private** GHCR package `ghcr.io/anshace/cortex:latest` (tagged `latest` + short
+SHA). It uses the built-in `GITHUB_TOKEN` — **no repo secrets to configure.**
+
+Cost on the Free plan (private repo): Actions ~2,000 Linux min/month (a build is
+~5–8 min); GHCR 500 MB storage + 1 GB/month egress. The push from Actions doesn't
+count against egress — only the EC2 pull does, and the image is small. Prune old
+package versions occasionally (GitHub → repo → Packages → cortex → versions).
+
+**One-time on EC2 — log in to GHCR** (private image needs auth to pull). Create a
+token at GitHub → Settings → Developer settings → **Personal access token** with
+`read:packages` (classic) or a fine-grained token scoped to this repo's packages:
+```sh
+echo <TOKEN> | docker login ghcr.io -u anshace --password-stdin   # persists in ~/.docker/config.json
+```
+
+**Each deploy** (after CI is green — watch the Actions tab):
+```sh
+cd /opt/cortex
+git pull                                                    # get compose/Caddyfile changes
+docker compose -f docker-compose.prod.yml pull app          # fetch the new image from GHCR
+DOMAIN=nexus.isroot.in docker compose -f docker-compose.prod.yml up -d --remove-orphans
+docker image prune -f
+```
+No `--build`, so EC2 never compiles — the whole deploy is a ~30 s image pull. You
+still need `.env` and `seed_users.json` present on the box (they're gitignored and
+never baked into the image).
+
 ## Keeping a small (t3.micro) box healthy
 
 The Rust build needs more RAM than a `t3.micro` (1 GB) has, so it swaps and

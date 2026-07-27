@@ -3,6 +3,11 @@
 #   DOMAIN=<your-ip>.sslip.io docker compose -f docker-compose.prod.yml up -d --build
 services:
   app:
+    # Pull the CI-built image (recommended on the small box — no compiling on EC2):
+    #   docker compose -f docker-compose.prod.yml pull app && ... up -d
+    # `build: .` is kept as a fallback so you can still build locally with
+    # `... up -d --build`. The `image:` name is also the tag a local build produces.
+    image: ghcr.io/anshace/cortex:latest
     build: .
     restart: unless-stopped
     environment:
