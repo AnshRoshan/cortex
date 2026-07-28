@@ -92,11 +92,48 @@ impl Default for ServerConfig {
     }
 }
 
-/// A combined filter handling all server routes.
+/// A combined filter handling all server routes, with security response headers
+/// applied to every reply (static assets and API alike).
 pub fn server(config: ServerConfig) -> BoxedFilter<(impl Reply,)> {
-    warp::path("api")
-        .and(backend(config))
-        .or(frontend())
+    let routes = warp::path("api").and(backend(config)).or(frontend());
+
+    // Content-Security-Policy tuned to the app's real needs:
+    // - script-src 'self' 'wasm-unsafe-eval'  → Vite ES-module bundles + the
+    //   rustpad-wasm module (WASM instantiation needs wasm-unsafe-eval).
+    // - style-src 'self' 'unsafe-inline'      → Chakra/emotion + Monaco inject
+    //   inline <style> tags (style injection is not a meaningful XSS vector).
+    // - worker-src 'self' blob:               → Monaco language web workers.
+    // - connect-src 'self'                     → same-origin API + the OT WebSocket.
+    // - img/font data: & blob:                 → inlined assets, pasted images.
+    // - frame-src 'self'                        → the sandboxed HTML-preview iframe.
+    // Set CSP_REPORT_ONLY=1 to emit it as report-only first (logs violations in
+    // the browser console without blocking) while verifying a deploy.
+    const CSP: &str = "default-src 'self'; base-uri 'self'; object-src 'none'; \
+        frame-ancestors 'none'; form-action 'self'; img-src 'self' data: blob:; \
+        font-src 'self' data:; style-src 'self' 'unsafe-inline'; \
+        script-src 'self' 'wasm-unsafe-eval'; worker-src 'self' blob:; \
+        connect-src 'self'; frame-src 'self'";
+    let csp_header = if std::env::var("CSP_REPORT_ONLY").is_ok() {
+        "content-security-policy-report-only"
+    } else {
+        "content-security-policy"
+    };
+
+    // HSTS is sent unconditionally: browsers ignore it over plain HTTP (so it is a
+    // no-op on localhost) and enforce it once served via HTTPS behind Caddy.
+    routes
+        .with(warp::reply::with::header("x-content-type-options", "nosniff"))
+        .with(warp::reply::with::header("x-frame-options", "DENY"))
+        .with(warp::reply::with::header("referrer-policy", "no-referrer"))
+        .with(warp::reply::with::header(
+            "permissions-policy",
+            "geolocation=(), microphone=(), camera=(), payment=(), usb=()",
+        ))
+        .with(warp::reply::with::header(
+            "strict-transport-security",
+            "max-age=63072000; includeSubDomains",
+        ))
+        .with(warp::reply::with::header(csp_header, CSP))
         .boxed()
 }
 

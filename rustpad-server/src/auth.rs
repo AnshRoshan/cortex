@@ -3,6 +3,9 @@
 //! Users are created only by backend seeding (see [`seed_from_file`]). There is
 //! no signup route. Every data route is gated behind a valid session cookie.
 
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use log::{info, warn};
@@ -99,6 +102,54 @@ pub async fn maybe_break_glass_owner_2fa(db: &Database) {
             Err(e) => warn!("OWNER_2FA_RESET: could not clear owner 2FA: {e}"),
         }
     }
+}
+
+/// In-memory login brute-force throttle: after `LOGIN_MAX_FAILS` failed attempts
+/// from one client key (IP) inside `LOGIN_WINDOW_SECS`, further attempts are
+/// rejected with 429 until the window rolls over. A successful login clears the
+/// key. ponytail: process-local fixed-window counter — right for a single-instance
+/// deploy; swap in a shared store only if this ever runs multi-instance.
+const LOGIN_MAX_FAILS: u32 = 15;
+const LOGIN_WINDOW_SECS: i64 = 10 * 60;
+type Throttle = Arc<Mutex<HashMap<String, (i64, u32)>>>; // key -> (window_start, fails)
+
+fn throttle_blocked(t: &Throttle, key: &str, now: i64) -> bool {
+    let m = t.lock().unwrap();
+    match m.get(key) {
+        Some((start, fails)) => now - start < LOGIN_WINDOW_SECS && *fails >= LOGIN_MAX_FAILS,
+        None => false,
+    }
+}
+
+fn throttle_record_fail(t: &Throttle, key: &str, now: i64) {
+    let mut m = t.lock().unwrap();
+    if m.len() > 10_000 {
+        m.clear(); // crude memory bound against IP-spray; resets all windows
+    }
+    let e = m.entry(key.to_string()).or_insert((now, 0));
+    if now - e.0 >= LOGIN_WINDOW_SECS {
+        *e = (now, 0); // window expired → start fresh
+    }
+    e.1 += 1;
+}
+
+fn throttle_reset(t: &Throttle, key: &str) {
+    t.lock().unwrap().remove(key);
+}
+
+/// Best-effort client IP: first `X-Forwarded-For` hop (set by Caddy) else the
+/// socket peer. Used only as a throttle key, not for authorization — note XFF is
+/// client-supplied, so configure Caddy's trusted-proxy handling for a hardened
+/// value; this remains useful defense-in-depth regardless.
+fn client_ip_filter() -> impl Filter<Extract = (String,), Error = Rejection> + Clone {
+    warp::header::optional::<String>("x-forwarded-for")
+        .and(warp::addr::remote())
+        .map(|xff: Option<String>, addr: Option<SocketAddr>| {
+            xff.and_then(|h| h.split(',').next().map(|s| s.trim().to_string()))
+                .filter(|s| !s.is_empty())
+                .or_else(|| addr.map(|a| a.ip().to_string()))
+                .unwrap_or_else(|| "unknown".to_string())
+        })
 }
 
 /// Generate a 256-bit random session token, hex-encoded.
@@ -211,10 +262,15 @@ pub fn routes(
     let auth_db = db.clone();
     let db_filter = warp::any().map(move || db.clone());
 
+    let throttle: Throttle = Arc::new(Mutex::new(HashMap::new()));
+    let throttle_filter = warp::any().map(move || throttle.clone());
+
     let login = warp::path!("login")
         .and(warp::post())
         .and(warp::body::json())
         .and(db_filter.clone())
+        .and(throttle_filter)
+        .and(client_ip_filter())
         .and_then(login_handler);
 
     let logout = warp::path!("logout")
@@ -242,7 +298,20 @@ async fn crypto_pubkey_handler() -> Result<impl Reply, Rejection> {
     ))
 }
 
-async fn login_handler(body: LoginReq, db: Database) -> Result<impl Reply, Rejection> {
+async fn login_handler(
+    body: LoginReq,
+    db: Database,
+    throttle: Throttle,
+    ip: String,
+) -> Result<impl Reply, Rejection> {
+    let now = now_secs();
+    // Brute-force guard: too many recent failures from this IP → 429 before we
+    // even hash, so a spray can't burn CPU or grind through passwords.
+    if throttle_blocked(&throttle, &ip, now) {
+        let reply = warp::reply::json(&json!({ "error": "too many attempts; try again later" }));
+        return Ok(warp::reply::with_status(reply, StatusCode::TOO_MANY_REQUESTS).into_response());
+    }
+
     // Email is case-insensitive and trimmed (stored lowercase).
     let email = body.email.trim().to_lowercase();
     let user = db.get_user_by_email(&email).await.ok().flatten();
@@ -256,6 +325,7 @@ async fn login_handler(body: LoginReq, db: Database) -> Result<impl Reply, Rejec
         }
     };
     if !authed {
+        throttle_record_fail(&throttle, &ip, now);
         let reply = warp::reply::json(&json!({ "error": "invalid credentials" }));
         return Ok(warp::reply::with_status(reply, StatusCode::UNAUTHORIZED).into_response());
     }
@@ -272,6 +342,7 @@ async fn login_handler(body: LoginReq, db: Database) -> Result<impl Reply, Rejec
                     .map(|s| verify_totp(s, &user.email, code))
                     .unwrap_or(false);
                 if !ok {
+                    throttle_record_fail(&throttle, &ip, now);
                     let reply = warp::reply::json(&json!({ "error": "invalid code" }));
                     return Ok(
                         warp::reply::with_status(reply, StatusCode::UNAUTHORIZED).into_response(),
@@ -299,6 +370,7 @@ async fn login_handler(body: LoginReq, db: Database) -> Result<impl Reply, Rejec
             warp::reply::with_status(reply, StatusCode::INTERNAL_SERVER_ERROR).into_response(),
         );
     }
+    throttle_reset(&throttle, &ip); // clean login clears the IP's failure count
     let _ = db.audit(user.org_id, Some(user.id), "login", None, now_secs()).await;
     // Set COOKIE_SECURE=1 when serving over HTTPS (i.e. any real deployment).
     let secure = if std::env::var("COOKIE_SECURE").is_ok() { "; Secure" } else { "" };
