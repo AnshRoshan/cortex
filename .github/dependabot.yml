@@ -1,27 +1,34 @@
 version: 2
 updates:
-  # Rust backend + wasm crates (Cargo workspace at the repo root).
+  # Rust backend + wasm crates (Cargo workspace at the repo root). Group only
+  # minor/patch bumps into one PR; a breaking major (e.g. sqlx 0.x) then lands
+  # as its own PR to review/migrate instead of poisoning the whole group's CI.
   - package-ecosystem: cargo
     directory: "/"
     schedule:
       interval: weekly
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 10
     groups:
-      cargo:
+      cargo-minor:
         patterns: ["*"]
+        update-types: ["minor", "patch"]
 
-  # Frontend npm dependencies.
+  # Frontend npm dependencies (same minor/patch grouping).
   - package-ecosystem: npm
     directory: "/"
     schedule:
       interval: weekly
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 10
     groups:
-      npm:
+      npm-minor:
         patterns: ["*"]
+        update-types: ["minor", "patch"]
 
-  # GitHub Actions used in workflows.
+  # GitHub Actions used in workflows — grouped into a single PR.
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
       interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
