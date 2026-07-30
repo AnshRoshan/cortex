@@ -17,9 +17,9 @@ async fn main() {
         .await
         .expect("Unable to connect to SQLITE_URI");
 
-    // Seed users from SEED_USERS (env JSON) or the SEED_FILE — the only way users
-    // are created.
-    auth::seed_users(&database).await;
+    // First run only: create the default owner account (admin/admin, override
+    // with ADMIN_USERNAME/ADMIN_PASSWORD) so a fresh deploy is usable at once.
+    auth::ensure_default_owner(&database).await;
 
     // Break-glass: set OWNER_2FA_RESET=1 on the host to clear the owner's 2FA if
     // the authenticator device is ever lost. Only the owner controls the host.

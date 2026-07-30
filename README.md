@@ -10,9 +10,10 @@ file upload/download added on top.
 
 ## Key properties
 
-- **Closed by default.** No signup. Users exist only by backend seeding. Every
-  data route (documents, the collaborative socket, stats) requires a valid
-  session; nothing is reachable anonymously.
+- **Closed by default.** No public signup. A default owner is created on first
+  run and provisions every other account from the owner console. Every data
+  route (documents, the collaborative socket, stats) requires a valid session;
+  nothing is reachable anonymously.
 - **Roles.** `admin` owns a workspace, adds members, and is the only role that
   can upload/download files. Regular `user`s can open and edit files
   collaboratively.
@@ -31,43 +32,66 @@ file upload/download added on top.
 
 ## Configure
 
-Copy `seed_users.example.json` to `seed_users.json` and set real credentials.
-This is the **only** way accounts are created:
+No configuration is required to start. On first run (an empty database) the
+server creates a **default owner** account:
 
-```json
-[
-  { "email": "you@example.com", "password": "a-strong-password", "role": "admin" }
-]
+```
+username: admin
+password: admin
 ```
 
-`.env` controls `SQLITE_URI` (defaults to `sqlite://authpad.db`), `SEED_FILE`,
-and `PORT`.
+Sign in and change the password immediately (Settings → Security). To set your
+own initial owner instead, put `ADMIN_USERNAME` / `ADMIN_PASSWORD` in `.env`
+before the first start — they're ignored once any user exists.
 
-## Run with Docker (recommended — no host toolchain needed)
+`.env` also controls `SQLITE_URI` (defaults to `sqlite://authpad.db`) and
+`PORT`. Everyone (owner and users) can change their own username and password
+from Settings; the owner provisions additional accounts from the owner console.
 
-### Fast dev loop (use this while building)
+## Run it (self-hosted)
+
+Cortex ships as a single self-contained image — **one command, no domain, no
+build, no clone:**
 
 ```bash
-docker compose -f docker-compose.dev.yml up
-# → open http://localhost:5173
+docker run -d -p 3030:3030 -v cortex-data:/data ghcr.io/anshace/cortex:latest
+# → open http://localhost:3030, sign in as  admin / admin , then change the password
 ```
 
-- **Frontend hot-reloads** — edit a `.tsx`, the browser updates instantly, no rebuild.
-- **Backend auto-recompiles** on Rust changes (cargo-watch, debug build).
-- Cargo registry, build cache, `node_modules`, and the wasm package are cached in
-  volumes, so only the **first** `up` is slow; every run after is fast.
+Everything (users, sessions, workspaces, files, chat) lives in SQLite inside the
+`cortex-data` volume, so your data survives restarts and upgrades. Sign in as the
+default owner; the owner creates orgs, workspaces, and accounts from the owner
+console; an admin adds members and manages files; members join and edit.
 
-### Production image (single self-contained container)
+### With your own domain + automatic HTTPS (optional)
+
+Only needed if you want to serve Cortex on a public URL. `docker-compose.prod.yml`
+adds Caddy, which fetches a TLS certificate for `DOMAIN` automatically. No real
+domain? Point at your server's IP via sslip.io (e.g. `203.0.113.9.sslip.io`):
 
 ```bash
-docker compose up --build
-# → open http://localhost:3030
+DOMAIN=203.0.113.9.sslip.io docker compose -f docker-compose.prod.yml up -d
 ```
 
-Stop one before starting the other — both use port 3030.
+`COOKIE_SECURE=1` (already set there) makes the session cookie HTTPS-only. Plain
+`docker run` above works over HTTP with no domain and no Caddy. Full server
+walkthrough: DEPLOY.md.
 
-Sign in with a seeded account (see `seed_users.json`). An admin creates the
-workspace, adds members, and manages files; members join and edit.
+### Build from source instead of pulling the image
+
+```bash
+docker compose up --build      # builds the image locally → http://localhost:3030
+```
+
+### Dev loop (hot-reload, for hacking on Cortex)
+
+```bash
+docker compose -f docker-compose.dev.yml up   # → http://localhost:5173
+```
+
+Frontend hot-reloads; the backend recompiles on Rust changes. First `up` is slow
+(builds the image); later runs are fast. Stop the other composes first — all use
+port 3030.
 
 ## Build without Docker
 

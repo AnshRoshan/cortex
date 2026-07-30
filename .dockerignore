@@ -12,7 +12,7 @@ README.md
 docker-compose.yml
 docker-compose.dev.yml
 graphify-out
-# Secrets + local DB must never enter an image layer (seed is bind-mounted).
+# Secrets + local DB must never enter an image layer (COPY . . in the build).
 seed_users.json
 *.db
 *.db-journal

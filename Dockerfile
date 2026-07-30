@@ -52,6 +52,5 @@ COPY --from=frontend /usr/src/app/dist dist
 COPY --from=backend /rustpad-server .
 USER app
 ENV SQLITE_URI=sqlite:///data/authpad.db
-ENV SEED_FILE=/app/seed_users.json
 EXPOSE 3030
 CMD [ "./rustpad-server" ]

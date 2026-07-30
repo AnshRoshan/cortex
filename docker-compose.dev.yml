@@ -22,10 +22,11 @@ services:
     environment:
       RUST_LOG: info
       SQLITE_URI: sqlite:///data/authpad.db
-      SEED_FILE: /app/seed_users.json
+      # First-run owner (admin/admin by default). Change it on first login.
+      ADMIN_USERNAME: "${ADMIN_USERNAME:-admin}"
+      ADMIN_PASSWORD: "${ADMIN_PASSWORD:-admin}"
     volumes:
       - cortex-data:/data
-      - ./seed_users.json:/app/seed_users.json:ro
     ports:
       - "3030:3030"
 

@@ -1,5 +1,10 @@
 # Deploying Cortex to EC2
 
+> Just want it running? You don't need any of this. One command, no domain:
+> `docker run -d -p 3030:3030 -v cortex-data:/data ghcr.io/anshace/cortex:latest`
+> and open http://localhost:3030 (sign in `admin` / `admin`). This guide is for
+> the extra step of serving it on a **public URL with HTTPS**.
+
 One container + SQLite; Caddy in front provides free auto-renewing HTTPS.
 Works with a real domain (e.g. `nexus.isroot.in`) or, with no domain, sslip.io
 which maps `<ip>.sslip.io` to your IP automatically. The URL is set via `DOMAIN=`.
@@ -26,19 +31,12 @@ From your machine (PowerShell), excluding local build junk:
 scp -i key.pem -r . ubuntu@<ELASTIC_IP>:cortex   # or git clone on the server
 ```
 
-If you **cloned via git** (rather than scp), create the seed file first — it's
-gitignored, so it isn't in the repo:
-
-```sh
-cp seed_users.example.json seed_users.json
-nano seed_users.json   # set the owner (role "root") + users/passwords
-```
-
-Then on the server: `chmod 644 cortex/seed_users.json`. It holds plaintext seed
-passwords, but the container's app user (uid 1000) must be able to read it, and
-it isn't owned by that user — so it needs to be world-readable. The box is
-single-tenant and the file is never web-exposed or committed to git. Change the
-passwords via the app after first login, then the file no longer matters.
+No seed file is needed. On first run (an empty database) the server creates a
+default owner account — username `admin`, password `admin`. To set your own
+instead, put `ADMIN_USERNAME` / `ADMIN_PASSWORD` in `.env` before the first
+start (they're ignored once any user exists). **Change the password on first
+login** (Settings → Security); after that the owner creates all other accounts
+from the owner console.
 
 ## 4. Run
 
@@ -111,9 +109,9 @@ docker compose -f docker-compose.prod.yml pull app          # fetch the new imag
 DOMAIN=nexus.isroot.in docker compose -f docker-compose.prod.yml up -d --remove-orphans
 docker image prune -f
 ```
-No `--build`, so EC2 never compiles — the whole deploy is a ~30 s image pull. You
-still need `.env` and `seed_users.json` present on the box (they're gitignored and
-never baked into the image).
+No `--build`, so EC2 never compiles — the whole deploy is a ~30 s image pull.
+Keep `.env` present on the box for `AI_KEY_SECRET` / `DOMAIN` (it's gitignored and
+never baked into the image); accounts persist in the `cortex-data` volume.
 
 ## Keeping a small (t3.micro) box healthy
 

@@ -306,6 +306,14 @@ impl Database {
         Ok(result.rows_affected() == 1)
     }
 
+    /// Number of user accounts. Used to decide the first-run owner bootstrap.
+    pub async fn count_users(&self) -> Result<i64> {
+        let (n,): (i64,) = sqlx::query_as("SELECT count(*) FROM users")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(n)
+    }
+
     /// Look up a user by email for login.
     pub async fn get_user_by_email(&self, email: &str) -> Result<Option<User>> {
         sqlx::query_as(

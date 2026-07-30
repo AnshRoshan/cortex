@@ -1,14 +1,16 @@
-//! Authentication: seeded users, password hashing, server-side sessions.
+//! Authentication: password hashing, server-side sessions, first-run owner.
 //!
-//! Users are created only by backend seeding (see [`seed_from_file`]). There is
-//! no signup route. Every data route is gated behind a valid session cookie.
+//! On first boot the server creates a default owner account (see
+//! [`ensure_default_owner`]); after that, accounts are managed from the owner
+//! console. There is no public signup. Every data route is gated behind a valid
+//! session cookie.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use log::{info, warn};
+use log::warn;
 use rand::RngCore;
 use serde::Deserialize;
 use serde_json::json;
@@ -159,75 +161,45 @@ fn random_token() -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
-#[derive(Deserialize)]
-struct SeedUser {
-    email: String,
-    password: String,
-    #[serde(default)]
-    name: String,
-    #[serde(default = "default_role")]
-    role: String,
-}
-
-fn default_role() -> String {
-    "user".to_string()
-}
-
-/// Seed users from a JSON file. This is the ONLY way users are created.
-///
-/// The file is backend-only and holds plaintext passwords that are hashed on
-/// insert; existing emails are skipped, so editing a password there won't change
-/// an existing account.
-// ponytail: seed-on-startup from a file; matches the "DB-seeding only" rule
-// without a separate CLI. Upgrade path: a `seed` subcommand if rotation matters.
-/// Seed users from the `SEED_USERS` env var (raw JSON array) if set, otherwise
-/// from the `SEED_FILE` JSON file. Env wins so everything can live in one .env.
-pub async fn seed_users(db: &Database) {
-    if let Ok(json) = std::env::var("SEED_USERS") {
-        if !json.trim().is_empty() {
-            seed_from_json(db, &json, "SEED_USERS env").await;
+/// First-run bootstrap: if the database has no users, create the default owner
+/// so a fresh self-hosted deploy is usable immediately. Username/password
+/// default to `admin`/`admin` and can be overridden with the `ADMIN_USERNAME`
+/// and `ADMIN_PASSWORD` env vars. Once any user exists this is a no-op, so it
+/// never clobbers a changed password on restart.
+// ponytail: one default owner, no seed files. The owner creates everyone else
+// from the console; the loud warning below says to change the password on first
+// login. Upgrade path: force a password change on first login if that matters.
+pub async fn ensure_default_owner(db: &Database) {
+    match db.count_users().await {
+        Ok(0) => {}
+        Ok(_) => return, // users already exist — never re-create
+        Err(e) => {
+            warn!("could not count users; skipping owner bootstrap: {e}");
             return;
         }
     }
-    let path = std::env::var("SEED_FILE").unwrap_or_else(|_| String::from("seed_users.json"));
-    match std::fs::read_to_string(&path) {
-        Ok(contents) => seed_from_json(db, &contents, &format!("seed file {path:?}")).await,
-        Err(_) => warn!("no SEED_USERS env and no seed file at {path:?}; no users created this run"),
-    }
-}
-
-pub async fn seed_from_file(db: &Database, path: &str) {
-    match std::fs::read_to_string(path) {
-        Ok(contents) => seed_from_json(db, &contents, &format!("seed file {path:?}")).await,
-        Err(_) => warn!("no seed file at {path:?}; no users will be created this run"),
-    }
-}
-
-/// Parse a JSON array of seed users and create any that don't already exist.
-async fn seed_from_json(db: &Database, json: &str, source: &str) {
-    let users: Vec<SeedUser> = match serde_json::from_str(json) {
-        Ok(u) => u,
+    let username = std::env::var("ADMIN_USERNAME")
+        .unwrap_or_else(|_| "admin".to_string())
+        .trim()
+        .to_lowercase();
+    let username = if username.is_empty() { "admin".to_string() } else { username };
+    let password = std::env::var("ADMIN_PASSWORD").unwrap_or_else(|_| "admin".to_string());
+    let hash = match hash_password(&password) {
+        Ok(h) => h,
         Err(e) => {
-            warn!("could not parse {source}: {e}");
+            warn!("could not hash default owner password: {e}");
             return;
         }
     };
-    for u in users {
-        let hash = match hash_password(&u.password) {
-            Ok(h) => h,
-            Err(e) => {
-                warn!("could not hash password for {}: {e}", u.email);
-                continue;
-            }
-        };
-        match db
-            .create_user_if_absent(&u.email.trim().to_lowercase(), &u.name, &hash, &u.role, None)
-            .await
-        {
-            Ok(true) => info!("seeded user {} ({})", u.email, u.role),
-            Ok(false) => {} // already exists
-            Err(e) => warn!("could not seed user {}: {e}", u.email),
-        }
+    match db
+        .create_user_if_absent(&username, "Owner", &hash, "root", None)
+        .await
+    {
+        Ok(_) => warn!(
+            "first run: created default owner '{username}'. Sign in and CHANGE \
+             THE PASSWORD immediately (Settings → Security)."
+        ),
+        Err(e) => warn!("could not create default owner: {e}"),
     }
 }
 
