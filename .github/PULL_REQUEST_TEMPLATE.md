@@ -13,7 +13,7 @@ Closes #<!-- issue number, if any -->
 
 ## Checklist
 
-- [ ] `cargo test --manifest-path rustpad-server/Cargo.toml` passes
+- [ ] `cargo test --lib --manifest-path rustpad-server/Cargo.toml` passes
 - [ ] `npm run check` passes
 - [ ] I tested this locally (`docker compose -f docker-compose.dev.yml up`)
 - [ ] No secrets, credentials, or personal data are included

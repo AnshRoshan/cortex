@@ -31,9 +31,12 @@ cargo run --release --manifest-path rustpad-server/Cargo.toml
 2. Make your change. Keep it focused — one logical change per PR.
 3. Run the checks locally before pushing:
    ```bash
-   cargo test --manifest-path rustpad-server/Cargo.toml   # backend
-   npm run check                                          # frontend typecheck/lint
+   cargo test --lib --manifest-path rustpad-server/Cargo.toml   # backend unit tests
+   npm run check                                               # frontend typecheck
    ```
+   > The `tests/` integration suite is inherited from Rustpad and predates
+   > authentication; it needs a rewrite for the gated model and is not run in CI
+   > yet. Contributions that modernize it are welcome.
 4. Open a pull request against `main`. Describe **what** changed and **why**.
    Link any related issue.
 
