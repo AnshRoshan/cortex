@@ -15,3 +15,6 @@ seed_users.json
 *.db-journal
 *.db-wal
 graphify-out/
+
+# Local-only notes/scratch kept out of the public repo (docs, documentation, etc.)
+archive/

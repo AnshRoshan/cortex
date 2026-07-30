@@ -2,8 +2,7 @@ name: build-image
 
 # Build the Cortex image on GitHub's runners (fast, plenty of RAM) and push it to
 # this repo's private GitHub Container Registry package. The tiny EC2 box then only
-# *pulls* the finished image instead of compiling Rust on 1 GB of RAM. See
-# documentation/architecture/deployment.md and DEPLOY.md.
+# *pulls* the finished image instead of compiling Rust on 1 GB of RAM. See DEPLOY.md.
 
 on:
   push:
