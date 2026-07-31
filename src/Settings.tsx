@@ -718,15 +718,18 @@ const BASEURL_HINTS: Record<string, string> = {
 function ProviderForm({
   scope,
   initial,
+  isNew,
   storageReady,
   onChanged,
 }: {
   scope: "user" | "org";
   initial: api.AiProviderView | null | undefined;
+  isNew: boolean;
   storageReady: boolean;
   onChanged: () => void;
 }) {
   const toast = useToast();
+  const [name, setName] = useState(initial?.name ?? "");
   const [provider, setProvider] = useState<api.AiProviderKind>(initial?.provider ?? "anthropic");
   const [baseUrl, setBaseUrl] = useState(initial?.base_url ?? "");
   const [model, setModel] = useState(initial?.model ?? "");
@@ -734,6 +737,8 @@ function ProviderForm({
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
   const hasKey = !!initial?.has_key;
+  const isCurrent = !!initial?.is_current;
+  const profileName = () => (isNew ? name.trim() : initial?.name ?? name.trim());
 
   async function test() {
     if (!model.trim()) return;
@@ -741,6 +746,7 @@ function ProviderForm({
     try {
       const r = await api.testAiProvider({
         scope,
+        name: profileName() || undefined,
         provider,
         base_url: baseUrl.trim() || undefined,
         model: model.trim(),
@@ -761,19 +767,26 @@ function ProviderForm({
 
   async function save(e: FormEvent) {
     e.preventDefault();
-    if (!model.trim()) return;
+    const nm = profileName();
+    if (!model.trim() || !nm) return;
     setSaving(true);
     try {
       await api.saveAiProvider({
         scope,
+        name: nm,
         provider,
         base_url: baseUrl.trim() || undefined,
         model: model.trim(),
         key: key.trim() || undefined,
       });
       setKey("");
+      if (isNew) {
+        setName("");
+        setModel("");
+        setBaseUrl("");
+      }
       onChanged();
-      toast({ title: "AI provider saved", status: "success", duration: 2000 });
+      toast({ title: "Model profile saved", status: "success", duration: 2000 });
     } catch (err) {
       fail(toast, err);
     } finally {
@@ -782,12 +795,18 @@ function ProviderForm({
   }
   async function clear() {
     try {
-      await api.deleteAiProvider(scope);
-      setModel("");
-      setBaseUrl("");
-      setKey("");
+      await api.deleteAiProvider(scope, profileName());
       onChanged();
       toast({ title: "Removed", status: "success", duration: 1800 });
+    } catch (err) {
+      fail(toast, err);
+    }
+  }
+  async function makeCurrent() {
+    try {
+      await api.setCurrentProvider(scope, profileName());
+      onChanged();
+      toast({ title: `Now using "${profileName()}"`, status: "success", duration: 1800 });
     } catch (err) {
       fail(toast, err);
     }
@@ -796,6 +815,23 @@ function ProviderForm({
   return (
     <Box as="form" onSubmit={save}>
       <VStack align="stretch" spacing={3} maxW="440px">
+        <FormControl>
+          <FormLabel fontSize="xs" color="ink.muted">
+            Profile name{" "}
+            {isCurrent && (
+              <Text as="span" color="brand.400">
+                · current
+              </Text>
+            )}
+          </FormLabel>
+          <Input
+            size="sm"
+            value={isNew ? name : initial?.name ?? ""}
+            isDisabled={!isNew}
+            placeholder="e.g. Claude, Fast, GPT-4o"
+            onChange={(e) => setName(e.target.value)}
+          />
+        </FormControl>
         <FormControl>
           <FormLabel fontSize="xs" color="ink.muted">
             Provider
@@ -836,8 +872,13 @@ function ProviderForm({
             onChange={(e) => setKey(e.target.value)}
           />
         </FormControl>
-        <HStack>
-          <Button size="sm" type="submit" isLoading={saving} isDisabled={!storageReady || !model.trim() || (!hasKey && !key.trim())}>
+        <HStack flexWrap="wrap">
+          <Button
+            size="sm"
+            type="submit"
+            isLoading={saving}
+            isDisabled={!storageReady || !model.trim() || !profileName() || (!hasKey && !key.trim())}
+          >
             Save
           </Button>
           <Button
@@ -850,7 +891,12 @@ function ProviderForm({
           >
             Test connection
           </Button>
-          {(hasKey || initial) && (
+          {!isNew && !isCurrent && hasKey && (
+            <Button size="sm" type="button" variant="outline" colorScheme="brand" onClick={makeCurrent}>
+              Make current
+            </Button>
+          )}
+          {!isNew && (
             <Button size="sm" variant="ghost" color="red.400" onClick={clear}>
               Remove
             </Button>
@@ -858,6 +904,73 @@ function ProviderForm({
         </HStack>
       </VStack>
     </Box>
+  );
+}
+
+function ProfilesSection({
+  scope,
+  profiles,
+  max,
+  storageReady,
+  onChanged,
+  title,
+  sub,
+}: {
+  scope: "user" | "org";
+  profiles: api.AiProviderView[];
+  max: number;
+  storageReady: boolean;
+  onChanged: () => void;
+  title: string;
+  sub: string;
+}) {
+  const [adding, setAdding] = useState(false);
+  return (
+    <Card>
+      <Text fontSize="sm" fontWeight={600} mb={1}>
+        {title}
+      </Text>
+      <Text fontSize="xs" color="ink.subtle" mb={4}>
+        {sub}
+      </Text>
+      <VStack align="stretch" spacing={5}>
+        {profiles.map((p) => (
+          <Box key={p.name} borderLeft="2px solid" borderColor={p.is_current ? "brand.400" : "surface.border"} pl={4}>
+            <ProviderForm scope={scope} initial={p} isNew={false} storageReady={storageReady} onChanged={onChanged} />
+          </Box>
+        ))}
+        {profiles.length === 0 && !adding && (
+          <Text fontSize="xs" color="ink.subtle">
+            No model profiles yet.
+          </Text>
+        )}
+        {adding ? (
+          <Box borderLeft="2px solid" borderColor="brand.400" pl={4}>
+            <ProviderForm
+              scope={scope}
+              initial={null}
+              isNew
+              storageReady={storageReady}
+              onChanged={() => {
+                setAdding(false);
+                onChanged();
+              }}
+            />
+            <Button size="xs" variant="ghost" mt={2} onClick={() => setAdding(false)}>
+              Cancel
+            </Button>
+          </Box>
+        ) : profiles.length < max ? (
+          <Button size="sm" variant="outline" alignSelf="flex-start" onClick={() => setAdding(true)}>
+            ＋ Add model profile
+          </Button>
+        ) : (
+          <Text fontSize="xs" color="ink.subtle">
+            Maximum of {max} profiles reached. Remove one to add another.
+          </Text>
+        )}
+      </VStack>
+    </Card>
   );
 }
 
@@ -892,7 +1005,8 @@ function AiPanel({ isAdmin }: { isAdmin: boolean }) {
             </Text>
             {data.effective ? (
               <Text fontSize="sm" color="ink.muted">
-                Active — using <Code fontSize="xs">{data.effective.model}</Code> via {data.effective.provider} (
+                Active — <Code fontSize="xs">{data.effective.name}</Code>: <Code fontSize="xs">{data.effective.model}</Code>{" "}
+                via {data.effective.provider} (
                 {data.effective.source === "user" ? "your key" : data.effective.source === "org" ? "org default" : "server key"}).
               </Text>
             ) : (
@@ -908,27 +1022,29 @@ function AiPanel({ isAdmin }: { isAdmin: boolean }) {
             )}
           </Card>
 
-          <Card>
-            <Text fontSize="sm" fontWeight={600} mb={1}>
-              Your key
-            </Text>
-            <Text fontSize="xs" color="ink.subtle" mb={4}>
-              A personal provider just for you. Overrides the org default.
-            </Text>
-            <ProviderForm scope="user" initial={data.mine} storageReady={data.storage_ready} onChanged={load} />
-          </Card>
+          <ProfilesSection
+            scope="user"
+            profiles={data.profiles}
+            max={data.max_profiles}
+            storageReady={data.storage_ready}
+            onChanged={load}
+            title="Your models"
+            sub="Up to 3 named profiles, each with its own provider, URL, model and key. The 'current' one is used by default; switch anytime here or in the Assistant."
+          />
 
           {isAdmin && (
-            <Card>
-              <Text fontSize="sm" fontWeight={600} mb={1}>
-                Organization default
-              </Text>
-              <Text fontSize="xs" color="ink.subtle" mb={4}>
-                Used by everyone in the org who hasn't set their own key.
-              </Text>
-              <ProviderForm scope="org" initial={data.org} storageReady={data.storage_ready} onChanged={load} />
+            <>
+              <ProfilesSection
+                scope="org"
+                profiles={data.org_profiles ?? []}
+                max={data.max_profiles}
+                storageReady={data.storage_ready}
+                onChanged={load}
+                title="Organization models"
+                sub="Shared profiles for everyone in the org who hasn't set their own."
+              />
               {data.org_users && data.org_users.length > 0 && (
-                <Box mt={5} pt={4} borderTop="1px solid" borderColor="surface.border">
+                <Card>
                   <Text fontSize="xs" color="ink.subtle" mb={2}>
                     {data.org_users.length} member{data.org_users.length === 1 ? "" : "s"} using a personal key (keys hidden):
                   </Text>
@@ -939,9 +1055,9 @@ function AiPanel({ isAdmin }: { isAdmin: boolean }) {
                       </Text>
                     ))}
                   </VStack>
-                </Box>
+                </Card>
               )}
-            </Card>
+            </>
           )}
         </>
       )}

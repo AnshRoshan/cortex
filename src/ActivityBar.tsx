@@ -21,20 +21,18 @@ import {
   VscFiles,
   VscGear,
   VscSignOut,
-  VscSourceControl,
   VscSparkle,
 } from "react-icons/vsc";
 
 import { Me } from "./api";
 
-export type Section = "explorer" | "scm" | "chat" | "assistant";
+export type Section = "explorer" | "chat" | "assistant";
 
 type Item = { key: Section; icon: ElementType; label: string; count?: number };
 
 type Props = {
   section: Section;
   onSelect: (s: Section) => void;
-  changeCount: number;
   chatCount?: number;
   me: Me;
   onProfile: () => void;
@@ -47,7 +45,6 @@ type Props = {
 function ActivityBar({
   section,
   onSelect,
-  changeCount,
   chatCount = 0,
   me,
   onProfile,
@@ -58,7 +55,6 @@ function ActivityBar({
 }: Props) {
   const items: Item[] = [
     { key: "explorer", icon: VscFiles, label: "Explorer" },
-    { key: "scm", icon: VscSourceControl, label: "Source Control", count: changeCount },
     { key: "chat", icon: VscComment, label: "Chat", count: chatCount },
     { key: "assistant", icon: VscSparkle, label: "Assistant" },
   ];
@@ -109,7 +105,11 @@ function ActivityBar({
                 size="md"
                 color={active ? "ink.base" : "ink.subtle"}
                 _hover={{ color: "ink.base", bg: "surface.hover" }}
-                onClick={() => onSelect(it.key)}
+                // Blur after click so the (focus-reopening) tooltip doesn't linger.
+                onClick={(e) => {
+                  onSelect(it.key);
+                  e.currentTarget.blur();
+                }}
               />
               {it.count != null && it.count > 0 && (
                 <Box

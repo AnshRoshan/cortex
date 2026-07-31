@@ -10,23 +10,26 @@ function Logo({ size = 24 }: { size?: number }) {
     >
       <defs>
         <linearGradient id="cortex-logo-g" x1="0" y1="0" x2="1" y2="1">
-          <stop offset="0" stopColor="#9576f4" />
-          <stop offset="1" stopColor="#6a45ec" />
+          <stop offset="0" stopColor="#1c1a2e" />
+          <stop offset="1" stopColor="#0d0b1a" />
         </linearGradient>
       </defs>
       <rect width="64" height="64" rx="16" fill="url(#cortex-logo-g)" />
-      <g stroke="#fff" strokeWidth="3" strokeLinecap="round" opacity="0.9">
-        <line x1="32" y1="32" x2="16" y2="18" />
-        <line x1="32" y1="32" x2="48" y2="18" />
-        <line x1="32" y1="32" x2="16" y2="46" />
-        <line x1="32" y1="32" x2="48" y2="46" />
+      {/* Central node with 5 blue strands to 5 light-lavender nodes (pentagon). */}
+      <g stroke="#5b6ef5" strokeWidth="3" strokeLinecap="round">
+        <line x1="32" y1="32" x2="32" y2="14" />
+        <line x1="32" y1="32" x2="49" y2="26" />
+        <line x1="32" y1="32" x2="43" y2="47" />
+        <line x1="32" y1="32" x2="21" y2="47" />
+        <line x1="32" y1="32" x2="15" y2="26" />
       </g>
-      <g fill="#fff">
-        <circle cx="32" cy="32" r="6" />
-        <circle cx="16" cy="18" r="4" />
-        <circle cx="48" cy="18" r="4" />
-        <circle cx="16" cy="46" r="4" />
-        <circle cx="48" cy="46" r="4" />
+      <g fill="#c7bcf6">
+        <circle cx="32" cy="32" r="6.5" fill="#7c6ff0" />
+        <circle cx="32" cy="14" r="4" />
+        <circle cx="49" cy="26" r="4" />
+        <circle cx="43" cy="47" r="4" />
+        <circle cx="21" cy="47" r="4" />
+        <circle cx="15" cy="26" r="4" />
       </g>
     </svg>
   );

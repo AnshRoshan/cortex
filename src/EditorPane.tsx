@@ -31,6 +31,7 @@ import {
   VscCircleFilled,
   VscOpenPreview,
   VscSettingsGear,
+  VscSparkle,
   VscSplitHorizontal,
 } from "react-icons/vsc";
 
@@ -70,6 +71,10 @@ type EditorPaneProps = {
   settingsActive: boolean;
   settingsNode: ReactNode;
   onCloseSettings: () => void;
+  // Assistant tabs are synthetic files (kind "assistant"); render each tab's own
+  // view by its file id. onOpenAssistant opens a new one.
+  renderAssistant: (fileId: number) => ReactNode;
+  onOpenAssistant: () => void;
 };
 
 function getWsUri(docId: string) {
@@ -309,6 +314,38 @@ function StatusBar({ info }: { info: StatusInfo }) {
   );
 }
 
+// The "open Assistant" affordance — lives in the editor's top-right, never the
+// sidebar. `labeled` shows text (empty state); otherwise it's a compact icon
+// button matching the tab-bar actions.
+function AssistantButton({ onOpen, labeled }: { onOpen: () => void; labeled?: boolean }) {
+  return (
+    <Tooltip label="Assistant" openDelay={300}>
+      <HStack
+        as="button"
+        h={labeled ? "28px" : "26px"}
+        px={labeled ? 2.5 : 0}
+        w={labeled ? undefined : "26px"}
+        spacing={1.5}
+        borderRadius="6px"
+        justify="center"
+        color="ink.muted"
+        _hover={{ bg: "surface.hover", color: "brand.400" }}
+        onClick={(e: ReactMouseEvent) => {
+          onOpen();
+          (e.currentTarget as HTMLElement).blur();
+        }}
+      >
+        <Icon as={VscSparkle} fontSize="16px" />
+        {labeled && (
+          <Text fontSize="13px" fontWeight={500}>
+            Assistant
+          </Text>
+        )}
+      </HStack>
+    </Tooltip>
+  );
+}
+
 // The top-level pane: one or two side-by-side editor groups + one status bar.
 function EditorPane(props: EditorPaneProps) {
   const { groups } = props;
@@ -343,7 +380,10 @@ function EditorPane(props: EditorPaneProps) {
 
   if (empty && !props.settingsActive) {
     return (
-      <Center flex={1} minW={0} flexDirection="column" gap={4} bg="surface.bg" px={6} textAlign="center">
+      <Center flex={1} minW={0} flexDirection="column" gap={4} bg="surface.bg" px={6} textAlign="center" position="relative">
+        <Box position="absolute" top={2} right={2}>
+          <AssistantButton onOpen={props.onOpenAssistant} labeled />
+        </Box>
         <Box opacity={0.45}>
           <Logo size={48} />
         </Box>
@@ -392,6 +432,8 @@ function EditorPane(props: EditorPaneProps) {
                 settingsHere={props.settingsActive && props.focused === i}
                 settingsNode={props.settingsNode}
                 onCloseSettings={props.onCloseSettings}
+                renderAssistant={props.renderAssistant}
+                onOpenAssistant={props.onOpenAssistant}
                 onStatus={handleStatus}
                 onSelectTab={(id) => props.onSelectTab(i, id)}
                 onCloseTab={(id) => props.onCloseTab(i, id)}
@@ -427,6 +469,8 @@ type GroupProps = {
   settingsHere: boolean;
   settingsNode: ReactNode;
   onCloseSettings: () => void;
+  renderAssistant: (fileId: number) => ReactNode;
+  onOpenAssistant: () => void;
   onStatus: (index: number, info: StatusInfo | null) => void;
   onSelectTab: (id: number) => void;
   onCloseTab: (id: number) => void;
@@ -446,6 +490,8 @@ function EditorGroup({
   settingsHere,
   settingsNode,
   onCloseSettings,
+  renderAssistant,
+  onOpenAssistant,
   onStatus,
   onSelectTab,
   onCloseTab,
@@ -560,6 +606,7 @@ function EditorGroup({
 
   const activeFile = openFiles.find((f) => f.id === activeFileId);
   const isBinary = activeFile?.kind === "binary";
+  const isAssistant = activeFile?.kind === "assistant";
   const docId = isBinary ? undefined : activeFile?.doc_id;
   const autoLang = activeFile ? extToLang(activeFile.path) : "plaintext";
   const language = langOverride ?? autoLang;
@@ -621,7 +668,7 @@ function EditorGroup({
   // Publish this group's status up to the single bottom status bar (hidden for
   // binary files / the Settings tab).
   useEffect(() => {
-    if (isBinary || settingsHere) {
+    if (isBinary || settingsHere || isAssistant) {
       onStatus(index, null);
       return;
     }
@@ -646,7 +693,7 @@ function EditorGroup({
         : undefined,
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [index, isBinary, settingsHere, pos, counts, prefs.fontSize, prefs.showStats, language, connection, users, activeFile, canManage, userLabel]);
+  }, [index, isBinary, settingsHere, isAssistant, pos, counts, prefs.fontSize, prefs.showStats, language, connection, users, activeFile, canManage, userLabel]);
 
   // Clear our slot when this group unmounts (e.g. a split pane is closed).
   useEffect(() => () => onStatus(index, null), [index, onStatus]);
@@ -821,7 +868,11 @@ function EditorGroup({
         >
           {openFiles.map((f, i) => {
             const active = f.id === activeFileId && !settingsHere && !previewActive;
-            const { icon: fIcon, color: fColor } = fileIcon(f.path);
+            const isAssistantTab = f.kind === "assistant";
+            const { icon: fIcon, color: fColor } = isAssistantTab
+              ? { icon: VscSparkle, color: "brand.400" }
+              : fileIcon(f.path);
+            const tabName = isAssistantTab ? f.path : f.path.split("/").pop();
             return (
               <Fragment key={f.id}>
                 {slot === i && previewTabEl}
@@ -856,7 +907,7 @@ function EditorGroup({
                 >
                   <Icon as={fIcon} color={fColor} fontSize="14px" flexShrink={0} />
                   <Text fontSize="13px" whiteSpace="nowrap">
-                    {f.path.split("/").pop()}
+                    {tabName}
                   </Text>
                   <Flex
                     boxSize="18px"
@@ -917,10 +968,11 @@ function EditorGroup({
               </Flex>
             </HStack>
           )}
+
         </Flex>
 
-        {(previewable || canSplit) && (
-          <Flex align="center" gap={1} px={2} flexShrink={0} borderLeft="1px solid" borderColor="surface.border">
+        <Flex align="center" gap={1} px={2} flexShrink={0} borderLeft="1px solid" borderColor="surface.border">
+            <AssistantButton onOpen={onOpenAssistant} />
             {previewable && (
               <Tooltip label={previewActive ? "Back to editor" : "Open preview tab"} openDelay={300}>
                 <Flex
@@ -961,13 +1013,12 @@ function EditorGroup({
                 </Flex>
               </Tooltip>
             )}
-          </Flex>
-        )}
+        </Flex>
       </Flex>
 
       {/* Editor. Kept mounted (display:none) while the Preview tab is shown so
           the live document state survives switching back and forth. */}
-      <Box flex={1} minH={0} minW={0} display={isBinary || settingsHere || previewActive ? "none" : "block"}>
+      <Box flex={1} minH={0} minW={0} display={isBinary || settingsHere || isAssistant || previewActive ? "none" : "block"}>
         <Editor
           theme={resolveMonacoTheme(themeId, colorMode === "dark")}
           beforeMount={registerThemes}
@@ -988,11 +1039,14 @@ function EditorGroup({
       </Box>
       {previewActive && (
         <Flex direction="column" flex={1} minH={0} minW={0}>
-          {isHtml ? <HtmlPreview text={mdText} /> : <MarkdownPreview text={mdText} />}
+          {isHtml ? <HtmlPreview text={mdText} file={activeFile} /> : <MarkdownPreview text={mdText} />}
         </Flex>
       )}
-      {isBinary && activeFile && <BinaryView file={activeFile} canManage={canManage} />}
+      {/* Settings is an overlay tab: while it's open it takes the body, so the
+          underlying active tab's content (binary / assistant) must stay hidden. */}
+      {isBinary && !settingsHere && activeFile && <BinaryView file={activeFile} canManage={canManage} />}
       {settingsHere && settingsNode}
+      {isAssistant && !settingsHere && activeFileId != null && renderAssistant(activeFileId)}
     </Flex>
   );
 }

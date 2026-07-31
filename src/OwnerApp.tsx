@@ -3,6 +3,7 @@ import {
   Box,
   Button,
   Center,
+  Code,
   Flex,
   HStack,
   IconButton,
@@ -160,6 +161,7 @@ function OwnerApp({ me, onLogout, onUpdated }: { me: Me; onLogout: () => void; o
             <TabList mb={6} borderColor={border}>
               <Tab fontSize="sm">Orgs</Tab>
               <Tab fontSize="sm">Accounts</Tab>
+              <Tab fontSize="sm">AI usage</Tab>
             </TabList>
             <TabPanels>
               {/* Orgs */}
@@ -392,12 +394,126 @@ function OwnerApp({ me, onLogout, onUpdated }: { me: Me; onLogout: () => void; o
                   </Tbody>
                 </TableCard>
               </TabPanel>
+
+              {/* AI usage / cost */}
+              <TabPanel p={0}>
+                <UsagePanel border={border} />
+              </TabPanel>
             </TabPanels>
           </Tabs>
         </Box>
       </Box>
 
     </Flex>
+  );
+}
+
+// Rough list-price per 1M tokens for a cost estimate; free/unknown = $0.
+const USAGE_PRICING: { match: RegExp; in: number; out: number }[] = [
+  { match: /opus/i, in: 15, out: 75 },
+  { match: /sonnet/i, in: 3, out: 15 },
+  { match: /haiku/i, in: 0.8, out: 4 },
+  { match: /gpt-4o-mini|gpt-4\.1-mini/i, in: 0.15, out: 0.6 },
+  { match: /gpt-4o|gpt-4\.1/i, in: 2.5, out: 10 },
+  { match: /gpt-5/i, in: 1.25, out: 10 },
+];
+function modelCost(model: string, input: number, output: number): number {
+  const p = USAGE_PRICING.find((x) => x.match.test(model));
+  return p ? (input * p.in + output * p.out) / 1_000_000 : 0;
+}
+function fmtUsd(c: number): string {
+  if (c === 0) return "$0.00";
+  return c < 0.01 ? `$${c.toFixed(4)}` : `$${c.toFixed(2)}`;
+}
+
+function UsagePanel({ border }: { border: string }) {
+  const toast = useToast();
+  const [data, setData] = useState<api.AiUsageReport | null>(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    api
+      .getAiUsage()
+      .then(setData)
+      .catch((e) => toast({ title: e instanceof Error ? e.message : "Failed to load usage", status: "error", duration: 3000 }))
+      .finally(() => setLoading(false));
+  }, [toast]);
+
+  if (loading) return <Text fontSize="sm" color="ink.muted">Loading…</Text>;
+  if (!data) return null;
+
+  const totalCost = data.by_model.reduce((s, m) => s + modelCost(m.label, m.input_tokens, m.output_tokens), 0);
+  const tok = (n: number) => n.toLocaleString();
+
+  const stat = (label: string, value: string) => (
+    <Box bg="surface.panel" border="1px solid" borderColor={border} borderRadius="lg" px={4} py={3} flex={1}>
+      <Text fontSize="xs" color="ink.subtle">{label}</Text>
+      <Text fontSize="xl" fontWeight={700} color="ink.base" sx={{ fontVariantNumeric: "tabular-nums" }}>{value}</Text>
+    </Box>
+  );
+
+  return (
+    <VStack align="stretch" spacing={5}>
+      <Text fontSize="xs" color="ink.subtle">
+        {data.scope === "all" ? "Across every organization." : "Your organization only."} Cost is a list-price estimate — free models count as $0.
+      </Text>
+      <HStack spacing={3} align="stretch">
+        {stat("Requests", tok(data.totals.requests))}
+        {stat("Input tokens", tok(data.totals.input_tokens))}
+        {stat("Output tokens", tok(data.totals.output_tokens))}
+        {stat("Est. cost", fmtUsd(totalCost))}
+      </HStack>
+
+      <Box>
+        <Text fontSize="sm" fontWeight="semibold" mb={3}>By model</Text>
+        <TableCard border={border} empty={data.by_model.length === 0} emptyText="No AI usage yet.">
+          <Thead>
+            <Tr>
+              <Th>Model</Th>
+              <Th isNumeric>Requests</Th>
+              <Th isNumeric>Input</Th>
+              <Th isNumeric>Output</Th>
+              <Th isNumeric>Est. cost</Th>
+            </Tr>
+          </Thead>
+          <Tbody>
+            {data.by_model.map((m) => (
+              <Tr key={m.label}>
+                <Td><Code fontSize="xs">{m.label}</Code></Td>
+                <Td isNumeric>{tok(m.requests)}</Td>
+                <Td isNumeric>{tok(m.input_tokens)}</Td>
+                <Td isNumeric>{tok(m.output_tokens)}</Td>
+                <Td isNumeric>{fmtUsd(modelCost(m.label, m.input_tokens, m.output_tokens))}</Td>
+              </Tr>
+            ))}
+          </Tbody>
+        </TableCard>
+      </Box>
+
+      <Box>
+        <Text fontSize="sm" fontWeight="semibold" mb={3}>By user</Text>
+        <TableCard border={border} empty={data.by_user.length === 0} emptyText="No AI usage yet.">
+          <Thead>
+            <Tr>
+              <Th>User</Th>
+              <Th isNumeric>Requests</Th>
+              <Th isNumeric>Input</Th>
+              <Th isNumeric>Output</Th>
+            </Tr>
+          </Thead>
+          <Tbody>
+            {data.by_user.map((u) => (
+              <Tr key={u.label}>
+                <Td>{u.label}</Td>
+                <Td isNumeric>{tok(u.requests)}</Td>
+                <Td isNumeric>{tok(u.input_tokens)}</Td>
+                <Td isNumeric>{tok(u.output_tokens)}</Td>
+              </Tr>
+            ))}
+          </Tbody>
+        </TableCard>
+      </Box>
+    </VStack>
   );
 }
 

@@ -14,20 +14,23 @@ import { MouseEvent as ReactMouseEvent, useCallback, useEffect, useRef, useState
 import { FiMoon, FiSun } from "react-icons/fi";
 import useLocalStorageState from "use-local-storage-state";
 import {
+  VscAdd,
   VscArrowLeft,
   VscCloudUpload,
   VscCollapseAll,
+  VscComment,
   VscNewFile,
   VscNewFolder,
   VscOrganization,
   VscSearch,
   VscSettingsGear,
   VscSignOut,
+  VscTrash,
 } from "react-icons/vsc";
 
 import ActivityBar, { Section } from "./ActivityBar";
 import * as api from "./api";
-import { FileRow, Me, OrgData, Workspace, WorkspaceDetail } from "./api";
+import { AiMessage, FileRow, Me, OrgData, Workspace, WorkspaceDetail } from "./api";
 import ChatChannels, { ChatTarget } from "./ChatChannels";
 import CommandPalette, { PaletteItem } from "./CommandPalette";
 import { fileIcon } from "./fileIcon";
@@ -38,7 +41,6 @@ import EditorPane from "./EditorPane";
 import FileTree, { allFolderPaths, FileTreeHandle } from "./FileTree";
 import Loader from "./Loader";
 import Settings from "./Settings";
-import SourceControl, { ChangeType, SessionChange } from "./SourceControl";
 import { PanelHeader, PanelIconButton } from "./ui";
 import WorkspaceSwitcher from "./WorkspaceSwitcher";
 
@@ -59,9 +61,24 @@ type ConfirmCfg = { title: string; body: string; cta?: string; onConfirm: () => 
 type GroupState = { fileIds: number[]; activeId: number | null };
 const EMPTY_GROUPS: GroupState[] = [{ fileIds: [], activeId: null }];
 
+// Assistant tabs are synthetic files with a reserved NEGATIVE id and kind
+// "assistant", so they flow through the normal tab machinery (switch, reorder,
+// split, close) and survive pruning. Each maps to a saved conversation, so
+// several assistant tabs can be open at once.
+function assistantFile(id: number, label: string): FileRow {
+  return { id, workspace_id: 0, path: label, doc_id: "", kind: "assistant", mime: null };
+}
+
+// A saved assistant conversation (stored locally — this machine only). `wsId`
+// scopes it to the workspace it belongs to.
+type Conversation = { id: string; title: string; messages: AiMessage[]; updated: number; wsId?: number };
+// An open assistant tab: which conversation it shows (label is derived from the
+// conversation's title, or "New chat" until it has one).
+type AssistantTab = { convId: string };
+
 function pruneGroups(gs: GroupState[], exist: Set<number>): GroupState[] {
   const mapped = gs.map((g) => {
-    const ids = g.fileIds.filter((id) => exist.has(id));
+    const ids = g.fileIds.filter((id) => id < 0 || exist.has(id));
     const activeId = g.activeId != null && ids.includes(g.activeId) ? g.activeId : ids[ids.length - 1] ?? null;
     return { fileIds: ids, activeId };
   });
@@ -80,11 +97,18 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
   const [section, setSection] = useState<Section>("explorer");
   const [chatTarget, setChatTarget] = useState<ChatTarget>({ kind: "ws" });
   const [settingsOpen, setSettingsOpen] = useState(false);
+  // Assistant conversation history — persisted locally (this machine only).
+  const [conversations, setConversations] = useLocalStorageState<Conversation[]>("cortex-ai-conversations", {
+    defaultValue: [],
+  });
+  // Open assistant tabs (negative id → conversation). Session-only; the
+  // conversations themselves persist in `conversations`.
+  const [assistantTabs, setAssistantTabs] = useState<Record<number, AssistantTab>>({});
+  const assistantSeq = useRef(0);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [palette, setPalette] = useState<null | "files" | "commands">(null);
   const [sidebarW, setSidebarW] = useLocalStorageState<number>("cortex-sidebar-w", { defaultValue: 260 });
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
-  const [changes, setChanges] = useState<SessionChange[]>([]);
   const [prompt, setPrompt] = useState<PromptCfg | null>(null);
   const [confirm, setConfirm] = useState<ConfirmCfg | null>(null);
   // Unread tracking: poll the latest message id per thread and compare against
@@ -99,6 +123,20 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
 
   const treeRef = useRef<FileTreeHandle>(null);
   const uploadInput = useRef<HTMLInputElement>(null);
+
+  // Refs so the notification effect (which only reacts to `overview`) can read
+  // the current org/me/view without re-subscribing on every keystroke.
+  const orgRef = useRef<OrgData | null>(null);
+  orgRef.current = org;
+  const meRef = useRef(me);
+  meRef.current = me;
+  const sectionRef = useRef(section);
+  sectionRef.current = section;
+  const settingsRef = useRef(settingsOpen);
+  settingsRef.current = settingsOpen;
+  const activeKeyRef = useRef<string | null>(null); // assigned during render, below
+  const notifiedRef = useRef<Record<string, number>>({}); // thread -> last notified msg id
+  const notifySeeded = useRef(false); // skip the backlog present on first load
 
   // VS Code-style shortcuts the browser lets us intercept. (Ctrl+T/W/N/Tab are
   // reserved by the browser itself and can't be captured by a web app.)
@@ -199,8 +237,65 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
     };
   }, [orgId]);
 
+  // Ask once for permission to show desktop notifications.
+  useEffect(() => {
+    if ("Notification" in window && Notification.permission === "default") {
+      Notification.requestPermission().catch(() => {});
+    }
+  }, []);
+
+  // Desktop notification when a new message lands in any thread. Mentions (@you)
+  // always ping; other messages only ping while the tab is in the background.
+  useEffect(() => {
+    if (!overview) return;
+    const o = orgRef.current;
+    const meNow = meRef.current;
+    const myId = o?.members.find((m) => m.email === meNow.email)?.id;
+    const nameOf = (id: number) => {
+      const m = o?.members.find((x) => x.id === id);
+      return m ? m.name || m.email : "Someone";
+    };
+    const myLocal = meNow.email.split("@")[0];
+    const mentionsMe = (b: string) =>
+      (!!meNow.name && b.includes(`@${meNow.name}`)) || b.includes(`@${myLocal}`);
+    const canNotify =
+      notifySeeded.current && "Notification" in window && Notification.permission === "granted";
+
+    const consider = (key: string, s: api.ThreadSummary | undefined | null, isWs: boolean, open: () => void) => {
+      if (!s || s.last_sender === myId) return;
+      if (s.last_id <= (notifiedRef.current[key] ?? 0)) return;
+      notifiedRef.current[key] = s.last_id;
+      if (!canNotify) return;
+      const mention = s.body ? mentionsMe(s.body) : false;
+      const viewing =
+        !document.hidden && sectionRef.current === "chat" && !settingsRef.current && activeKeyRef.current === key;
+      if (viewing) return; // already looking at it
+      if (!mention && !document.hidden) return; // non-mentions only when backgrounded
+      const who = isWs ? `${nameOf(s.last_sender)} · workspace` : nameOf(s.last_sender);
+      const body = s.body?.startsWith("![") ? "📷 Photo" : s.body || "New message";
+      const n = new Notification(mention ? `🔔 ${who} mentioned you` : who, { body, tag: key });
+      n.onclick = () => {
+        window.focus();
+        open();
+        n.close();
+      };
+    };
+
+    const openChat = (t: ChatTarget) => {
+      setSettingsOpen(false);
+      setSidebarCollapsed(false);
+      setChatTarget(t);
+      setSection("chat");
+    };
+    if (activeWsId != null) consider(`ws:${activeWsId}`, overview.ws, true, () => openChat({ kind: "ws" }));
+    overview.dms.forEach((d) =>
+      consider(`dm:${d.peer_id}`, d, false, () => openChat({ kind: "dm", userId: d.peer_id })),
+    );
+    notifySeeded.current = true;
+  }, [overview, activeWsId]);
+
   const uploadDir = useRef<string>("");
-  const editorLike = section === "explorer" || section === "scm";
+  const editorLike = section === "explorer";
 
   // Drag the sidebar's right edge to resize it (persisted).
   function startSidebarDrag(e: ReactMouseEvent) {
@@ -292,22 +387,11 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
 
   useEffect(loadWs, [loadWs]);
 
-  // ----- session change tracking (feeds Source Control) -----
-  function noteChange(id: number, path: string, type: ChangeType) {
-    setChanges((prev) => {
-      const existing = prev.find((c) => c.id === id);
-      const finalType: ChangeType = existing?.type === "added" ? "added" : type;
-      return [...prev.filter((c) => c.id !== id), { id, path, type: finalType }];
-    });
-  }
-  const dropChange = (id: number) => setChanges((prev) => prev.filter((c) => c.id !== id));
-
   function selectWorkspace(id: number) {
     setActiveWsId(id);
     setGroups(EMPTY_GROUPS);
     setFocused(0);
     setSection("explorer");
-    setChanges([]);
     if (orgId == null) {
       const w = wsRef.current.find((x) => x.id === id);
       if (w) window.history.pushState({}, "", "/" + w.slug);
@@ -323,7 +407,7 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
       cur.activeId = file.id;
       return g;
     });
-    setSection((s) => (s === "explorer" || s === "scm" ? s : "explorer"));
+    setSection("explorer");
   }
 
   function selectTab(gi: number, id: number) {
@@ -332,11 +416,72 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
     setFocused(gi);
   }
 
+  const newConvId = () => `c${Date.now()}${Math.random().toString(36).slice(2, 6)}`;
+
+  // Add an assistant tab bound to `convId` into the focused group and activate it.
+  function addAssistantTab(convId: string) {
+    const tabId = -(++assistantSeq.current); // -1, -2, -3, …
+    setAssistantTabs((m) => ({ ...m, [tabId]: { convId } }));
+    setSettingsOpen(false);
+    setGroups((gs) => {
+      const g = gs.map((x) => ({ ...x }));
+      const cur = g[focused] ?? g[0];
+      cur.fileIds = [...cur.fileIds, tabId];
+      cur.activeId = tabId;
+      return g;
+    });
+  }
+
+  // The ✨ button / "New chat": always open a NEW assistant tab, each its own
+  // fresh conversation.
+  function newConversation() {
+    setSidebarCollapsed(false);
+    addAssistantTab(newConvId());
+  }
+  const openAssistant = newConversation;
+
+  // Open a saved conversation: focus an existing tab showing it, else a new tab.
+  function openConversation(id: string) {
+    setSidebarCollapsed(false);
+    const existing = Object.entries(assistantTabs).find(([, t]) => t.convId === id);
+    if (existing) {
+      const tabId = Number(existing[0]);
+      setSettingsOpen(false);
+      setGroups((gs) => gs.map((g) => (g.fileIds.includes(tabId) ? { ...g, activeId: tabId } : g)));
+      return;
+    }
+    addAssistantTab(id);
+  }
+
+  // Save (or update) a conversation by id. Empty ones aren't stored.
+  function persistConversation(convId: string, msgs: AiMessage[]) {
+    const real = msgs.filter((m) => !m.note);
+    setConversations((cs) => {
+      const existing = cs.find((c) => c.id === convId);
+      const rest = cs.filter((c) => c.id !== convId);
+      if (real.length === 0) return rest;
+      const title = real.find((m) => m.role === "user")?.content.slice(0, 60) || "New chat";
+      const wsId = existing?.wsId ?? activeWsId ?? undefined;
+      return [{ id: convId, title, messages: msgs, updated: Date.now(), wsId }, ...rest].slice(0, 200);
+    });
+  }
+
+  function deleteConversation(id: string) {
+    setConversations((cs) => cs.filter((c) => c.id !== id));
+  }
+
   function focusGroup(gi: number) {
     setFocused(gi);
   }
 
   function closeTab(gi: number, id: number) {
+    if (id < 0) {
+      setAssistantTabs((m) => {
+        const next = { ...m };
+        delete next[id];
+        return next;
+      });
+    }
     setGroups((gs) => {
       const mapped = gs.map((g, i) => {
         if (i !== gi) return g;
@@ -395,7 +540,7 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
       ),
     );
     setFocused(gi);
-    setSection((s) => (s === "explorer" || s === "scm" ? s : "explorer"));
+    setSection("explorer");
   }
 
   // Split into a second group holding the given file (drag to the right edge).
@@ -472,16 +617,12 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
     run(async () => {
       const { file } = await api.createFile(activeWsId, path);
       loadWs();
-      if (!path.endsWith("/.keep")) {
-        openFile(file);
-        noteChange(file.id, file.path, "added");
-      }
+      if (!path.endsWith("/.keep")) openFile(file);
     });
   }
 
   function movePath(id: number, newPath: string) {
     run(() => api.moveFile(id, newPath), loadWs);
-    noteChange(id, newPath, "renamed");
   }
 
   function requestUpload(dir: string) {
@@ -498,7 +639,6 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
         const { file } = await api.uploadFile(activeWsId, f);
         const finalPath = dir ? `${dir}/${f.name}` : file.path;
         if (dir) await api.moveFile(file.id, finalPath);
-        noteChange(file.id, finalPath, "added");
       } catch (e) {
         fail(e);
       }
@@ -521,7 +661,6 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
             for (const f of targets) await api.deleteFile(f.id);
           },
           () => {
-            targets.forEach((f) => dropChange(f.id));
             loadWs(); // prunes the deleted files out of any open editor groups
           },
         ),
@@ -574,6 +713,7 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
         ? `ws:${activeWsId}`
         : `dm:${chatTarget.userId}`
       : null;
+  activeKeyRef.current = activeKey;
   const summaryPreview = (s: api.ThreadSummary, isWs: boolean) => {
     const body = s.body?.startsWith("![") ? "📷 Photo" : s.body || "";
     const fromMe = s.last_sender === myId;
@@ -594,11 +734,42 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
   const allFiles = ws?.files ?? [];
   const filesById = new Map(allFiles.map((f) => [f.id, f]));
   const focusedIdx = Math.min(focused, groups.length - 1);
+  const assistantLabel = (tabId: number) => {
+    const convId = assistantTabs[tabId]?.convId;
+    const title = conversations.find((c) => c.id === convId)?.title;
+    return title ? (title.length > 22 ? title.slice(0, 22) + "…" : title) : "New chat";
+  };
   const resolvedGroups = groups.map((g) => ({
-    files: g.fileIds.map((id) => filesById.get(id)).filter((f): f is FileRow => !!f),
+    files: g.fileIds
+      .map((id) => (id < 0 ? assistantFile(id, assistantLabel(id)) : filesById.get(id)))
+      .filter((f): f is FileRow => !!f),
     activeFileId: g.activeId,
   }));
   const treeActiveId = editorLike ? groups[focusedIdx]?.activeId ?? null : null;
+  // The conversation shown by the focused assistant tab (for sidebar highlight).
+  const focusedActiveId = groups[focusedIdx]?.activeId;
+  const activeConvId =
+    focusedActiveId != null && focusedActiveId < 0 ? assistantTabs[focusedActiveId]?.convId ?? null : null;
+  // Render the AiView for a given assistant tab id (its conversation).
+  const renderAssistant = (tabId: number) => {
+    const t = assistantTabs[tabId];
+    const conv = t ? conversations.find((c) => c.id === t.convId) : undefined;
+    return (
+      <AiView
+        key={t?.convId ?? tabId}
+        workspaceId={activeWsId}
+        onFilesChanged={loadWs}
+        files={allFiles}
+        initialMessages={conv?.messages ?? []}
+        onPersist={(m) => t && persistConversation(t.convId, m)}
+        recent={conversations
+          .filter((c) => c.wsId === activeWsId && c.id !== t?.convId)
+          .slice(0, 4)
+          .map((c) => ({ id: c.id, title: c.title }))}
+        onOpenConversation={openConversation}
+      />
+    );
+  };
 
   // Quick Open (Ctrl+P): every real file in the workspace, openable by name.
   const fileItems: PaletteItem[] = allFiles
@@ -637,7 +808,6 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
     { id: "newws", label: "New Workspace", icon: <Icon as={VscOrganization} />, run: newWorkspace },
     { id: "split", label: "Split Editor Right", run: () => splitGroup(focusedIdx) },
     { id: "explorer", label: "Show Explorer", keywords: "files tree", run: () => showSection("explorer") },
-    { id: "scm", label: "Show Source Control", keywords: "changes git diff", run: () => showSection("scm") },
     { id: "chat", label: "Show Chat", keywords: "messages dm", run: () => showSection("chat") },
     { id: "collapse", label: "Collapse All Folders", run: () => setCollapsed(new Set(allFolderPaths(allFiles))) },
     { id: "signout", label: "Sign Out", icon: <Icon as={VscSignOut} />, run: onLogout },
@@ -660,7 +830,6 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
             setSidebarCollapsed(false);
           }
         }}
-        changeCount={changes.length}
         chatCount={chatUnreadCount}
         me={me}
         onProfile={() => setSettingsOpen(true)}
@@ -670,7 +839,7 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
         onExit={onExit}
       />
 
-      {/* Side panel — Explorer, or Source Control */}
+      {/* Side panel — Explorer, or Chat */}
       <Flex
         as="nav"
         display={sidebarCollapsed ? "none" : "flex"}
@@ -682,15 +851,69 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
         borderColor="surface.border"
         overflow="hidden"
       >
-        {section === "scm" ? (
-          <SourceControl
-            changes={changes}
-            onClear={() => setChanges([])}
-            onOpen={(id) => {
-              const f = ws?.files.find((x) => x.id === id);
-              if (f) openFile(f);
-            }}
-          />
+        {section === "assistant" ? (
+          <Flex direction="column" flex={1} minH={0}>
+            {org.workspaces.length > 0 && (
+              <Box px={3} pt={3} pb={2}>
+                <WorkspaceSwitcher
+                  workspaces={org.workspaces}
+                  activeWsId={activeWsId}
+                  activeWs={activeWs}
+                  onSelect={selectWorkspace}
+                  onNew={newWorkspace}
+                  onRename={renameWorkspace}
+                  onDelete={deleteWorkspace}
+                />
+              </Box>
+            )}
+            <PanelHeader
+              title="Assistant"
+              actions={
+                <Tooltip label="New chat" openDelay={400}>
+                  <PanelIconButton aria-label="New chat" icon={<VscAdd />} onClick={newConversation} />
+                </Tooltip>
+              }
+            />
+            <Box flex={1} overflowY="auto" px={2} pb={2}>
+              {conversations.filter((c) => c.wsId === activeWsId).length === 0 ? (
+                <Text fontSize="xs" color="ink.subtle" px={2} py={2}>
+                  No conversations in this workspace yet. Click ＋ to start a new chat.
+                </Text>
+              ) : (
+                conversations
+                  .filter((c) => c.wsId === activeWsId)
+                  .map((c) => (
+                  <HStack
+                    key={c.id}
+                    px={2}
+                    py={1.5}
+                    spacing={2}
+                    borderRadius="md"
+                    cursor="pointer"
+                    role="group"
+                    bg={c.id === activeConvId ? "surface.hover" : "transparent"}
+                    _hover={{ bg: "surface.hover" }}
+                    onClick={() => openConversation(c.id)}
+                  >
+                    <Icon as={VscComment} color="ink.subtle" fontSize="sm" flexShrink={0} />
+                    <Text fontSize="sm" color="ink.base" isTruncated flex={1} minW={0}>
+                      {c.title}
+                    </Text>
+                    <Box
+                      opacity={0}
+                      _groupHover={{ opacity: 1 }}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        deleteConversation(c.id);
+                      }}
+                    >
+                      <Icon as={VscTrash} fontSize="xs" color="ink.subtle" _hover={{ color: "red.400" }} />
+                    </Box>
+                  </HStack>
+                ))
+              )}
+            </Box>
+          </Flex>
         ) : section === "chat" ? (
           <Flex direction="column" flex={1} minH={0}>
             {org.workspaces.length > 0 && (
@@ -817,9 +1040,7 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
       )}
 
       {/* Main pane */}
-      {section === "assistant" && !settingsOpen ? (
-        <AiView workspaceId={activeWsId} />
-      ) : section === "chat" && !settingsOpen ? (
+      {section === "chat" && !settingsOpen ? (
         <ChatView
           me={me}
           orgId={orgId}
@@ -847,6 +1068,8 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
             <Settings me={me} onClose={() => setSettingsOpen(false)} onUpdated={() => onUpdated?.()} />
           }
           onCloseSettings={() => setSettingsOpen(false)}
+          renderAssistant={renderAssistant}
+          onOpenAssistant={openAssistant}
         />
       )}
 

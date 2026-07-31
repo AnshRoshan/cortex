@@ -11,16 +11,27 @@ use anyhow::{bail, Result};
 use serde::Serialize;
 use sqlx::{sqlite::SqliteConnectOptions, ConnectOptions, SqlitePool};
 
-/// A stored AI provider config. `key_cipher` is the encrypted API key.
+/// A stored AI provider profile. `key_cipher` is the encrypted API key.
 #[derive(sqlx::FromRow, Clone, Debug)]
 pub struct ProviderRow {
     pub scope: String,
     pub scope_id: i64,
+    pub name: String,
     pub provider: String,
     pub base_url: Option<String>,
     pub model: String,
     pub key_cipher: String,
+    pub is_current: i64,
     pub updated_at: i64,
+}
+
+/// One row of aggregated AI token usage (grouped by model or by user).
+#[derive(sqlx::FromRow, serde::Serialize, Clone, Debug)]
+pub struct UsageStat {
+    pub label: String,
+    pub requests: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
 }
 
 /// Represents a document persisted in database storage.
@@ -853,58 +864,203 @@ impl Database {
         Ok(())
     }
 
-    // ----- AI provider config (keys stored encrypted; see crypto::secret_*) -----
+    // ----- AI provider profiles (up to 3 named per scope; keys encrypted) -----
 
-    /// The provider config for a scope, if any. `key_cipher` is the encrypted key.
-    pub async fn get_provider(&self, scope: &str, scope_id: i64) -> Result<Option<ProviderRow>> {
-        Ok(sqlx::query_as(
-            r#"SELECT scope, scope_id, provider, base_url, model, key_cipher, updated_at
-               FROM ai_provider WHERE scope = $1 AND scope_id = $2"#,
-        )
+    const PROVIDER_COLS: &'static str =
+        "scope, scope_id, name, provider, base_url, model, key_cipher, is_current, updated_at";
+
+    /// All provider profiles for a scope, current first.
+    pub async fn list_providers(&self, scope: &str, scope_id: i64) -> Result<Vec<ProviderRow>> {
+        Ok(sqlx::query_as(&format!(
+            "SELECT {} FROM ai_provider WHERE scope = $1 AND scope_id = $2 ORDER BY is_current DESC, name",
+            Self::PROVIDER_COLS
+        ))
+        .bind(scope)
+        .bind(scope_id)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// The current profile for a scope (falls back to the newest if none flagged).
+    pub async fn get_current_provider(&self, scope: &str, scope_id: i64) -> Result<Option<ProviderRow>> {
+        Ok(sqlx::query_as(&format!(
+            "SELECT {} FROM ai_provider WHERE scope = $1 AND scope_id = $2 \
+             ORDER BY is_current DESC, updated_at DESC LIMIT 1",
+            Self::PROVIDER_COLS
+        ))
         .bind(scope)
         .bind(scope_id)
         .fetch_optional(&self.pool)
         .await?)
     }
 
-    /// Create or replace a scope's provider config.
+    /// A specific named profile.
+    pub async fn get_named_provider(&self, scope: &str, scope_id: i64, name: &str) -> Result<Option<ProviderRow>> {
+        Ok(sqlx::query_as(&format!(
+            "SELECT {} FROM ai_provider WHERE scope = $1 AND scope_id = $2 AND name = $3",
+            Self::PROVIDER_COLS
+        ))
+        .bind(scope)
+        .bind(scope_id)
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    pub async fn count_providers(&self, scope: &str, scope_id: i64) -> Result<i64> {
+        let (n,): (i64,) =
+            sqlx::query_as(r#"SELECT count(*) FROM ai_provider WHERE scope = $1 AND scope_id = $2"#)
+                .bind(scope)
+                .bind(scope_id)
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(n)
+    }
+
+    /// Create or replace a named profile. The scope's first profile becomes current.
+    #[allow(clippy::too_many_arguments)]
     pub async fn upsert_provider(
         &self,
         scope: &str,
         scope_id: i64,
+        name: &str,
         provider: &str,
         base_url: Option<&str>,
         model: &str,
         key_cipher: &str,
         now: i64,
     ) -> Result<()> {
+        let first = self.count_providers(scope, scope_id).await.unwrap_or(0) == 0;
         sqlx::query(
-            r#"INSERT INTO ai_provider (scope, scope_id, provider, base_url, model, key_cipher, updated_at)
-               VALUES ($1, $2, $3, $4, $5, $6, $7)
-               ON CONFLICT(scope, scope_id) DO UPDATE SET
+            r#"INSERT INTO ai_provider (scope, scope_id, name, provider, base_url, model, key_cipher, is_current, updated_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+               ON CONFLICT(scope, scope_id, name) DO UPDATE SET
                  provider = excluded.provider, base_url = excluded.base_url,
                  model = excluded.model, key_cipher = excluded.key_cipher,
                  updated_at = excluded.updated_at"#,
         )
         .bind(scope)
         .bind(scope_id)
+        .bind(name)
         .bind(provider)
         .bind(base_url)
         .bind(model)
         .bind(key_cipher)
+        .bind(if first { 1 } else { 0 })
         .bind(now)
         .execute(&self.pool)
         .await?;
         Ok(())
     }
 
-    pub async fn delete_provider(&self, scope: &str, scope_id: i64) -> Result<()> {
-        sqlx::query(r#"DELETE FROM ai_provider WHERE scope = $1 AND scope_id = $2"#)
+    /// Mark one profile current for its scope (clears the others).
+    pub async fn set_current_provider(&self, scope: &str, scope_id: i64, name: &str) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(r#"UPDATE ai_provider SET is_current = 0 WHERE scope = $1 AND scope_id = $2"#)
             .bind(scope)
             .bind(scope_id)
+            .execute(&mut tx)
+            .await?;
+        sqlx::query(r#"UPDATE ai_provider SET is_current = 1 WHERE scope = $1 AND scope_id = $2 AND name = $3"#)
+            .bind(scope)
+            .bind(scope_id)
+            .bind(name)
+            .execute(&mut tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn delete_provider(&self, scope: &str, scope_id: i64, name: &str) -> Result<()> {
+        sqlx::query(r#"DELETE FROM ai_provider WHERE scope = $1 AND scope_id = $2 AND name = $3"#)
+            .bind(scope)
+            .bind(scope_id)
+            .bind(name)
             .execute(&self.pool)
             .await?;
+        // If the deleted profile was current, promote the newest survivor.
+        sqlx::query(
+            r#"UPDATE ai_provider SET is_current = 1
+               WHERE scope = $1 AND scope_id = $2 AND updated_at = (
+                   SELECT max(updated_at) FROM ai_provider WHERE scope = $1 AND scope_id = $2)
+               AND NOT EXISTS (
+                   SELECT 1 FROM ai_provider WHERE scope = $1 AND scope_id = $2 AND is_current = 1)"#,
+        )
+        .bind(scope)
+        .bind(scope_id)
+        .execute(&self.pool)
+        .await?;
         Ok(())
+    }
+
+    // ----- AI usage accounting (for the owner/admin cost dashboard) -----
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn record_usage(
+        &self,
+        org_id: Option<i64>,
+        user_id: i64,
+        provider: &str,
+        model: &str,
+        input: i64,
+        output: i64,
+        now: i64,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"INSERT INTO ai_usage (org_id, user_id, provider, model, input_tokens, output_tokens, created_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7)"#,
+        )
+        .bind(org_id)
+        .bind(user_id)
+        .bind(provider)
+        .bind(model)
+        .bind(input)
+        .bind(output)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Usage grouped by model. `all` = every org (root); else just `org_id` (admin).
+    pub async fn usage_by_model(&self, org_id: Option<i64>, all: bool) -> Result<Vec<UsageStat>> {
+        let cols = "model AS label, count(*) AS requests, \
+                    COALESCE(sum(input_tokens),0) AS input_tokens, \
+                    COALESCE(sum(output_tokens),0) AS output_tokens";
+        let order = "ORDER BY sum(input_tokens) + sum(output_tokens) DESC";
+        if all {
+            Ok(sqlx::query_as(&format!("SELECT {cols} FROM ai_usage GROUP BY model {order}"))
+                .fetch_all(&self.pool)
+                .await?)
+        } else {
+            Ok(sqlx::query_as(&format!("SELECT {cols} FROM ai_usage WHERE org_id = $1 GROUP BY model {order}"))
+                .bind(org_id)
+                .fetch_all(&self.pool)
+                .await?)
+        }
+    }
+
+    /// Usage grouped by user (label = email).
+    pub async fn usage_by_user(&self, org_id: Option<i64>, all: bool) -> Result<Vec<UsageStat>> {
+        let cols = "COALESCE(u.email, 'unknown') AS label, count(*) AS requests, \
+                    COALESCE(sum(a.input_tokens),0) AS input_tokens, \
+                    COALESCE(sum(a.output_tokens),0) AS output_tokens";
+        let order = "ORDER BY sum(a.input_tokens) + sum(a.output_tokens) DESC";
+        if all {
+            Ok(sqlx::query_as(&format!(
+                "SELECT {cols} FROM ai_usage a LEFT JOIN users u ON u.id = a.user_id GROUP BY a.user_id {order}"
+            ))
+            .fetch_all(&self.pool)
+            .await?)
+        } else {
+            Ok(sqlx::query_as(&format!(
+                "SELECT {cols} FROM ai_usage a LEFT JOIN users u ON u.id = a.user_id \
+                 WHERE a.org_id = $1 GROUP BY a.user_id {order}"
+            ))
+            .bind(org_id)
+            .fetch_all(&self.pool)
+            .await?)
+        }
     }
 
     /// (user_id, provider, model) for every user in an org who set a personal

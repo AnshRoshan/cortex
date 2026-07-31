@@ -10,7 +10,7 @@ export type FileRow = {
   workspace_id: number;
   path: string;
   doc_id: string;
-  kind: "text" | "binary";
+  kind: "text" | "binary" | "assistant"; // "assistant" is the synthetic AI tab, not a stored file
   mime: string | null;
 };
 export type Member = { id: number; email: string; name: string; role: string };
@@ -218,24 +218,116 @@ export async function toggleReaction(kind: "ws" | "dm", msgId: number, emoji: st
   await encFetch(`/api/reaction`, { method: "POST", body: { kind, msg_id: msgId, emoji } });
 }
 
-// ----- AI assistant (grounded in the workspace's files; server holds the key) -----
-export type AiMessage = { role: "user" | "assistant"; content: string };
-export async function aiChat(workspaceId: number, messages: AiMessage[]): Promise<{ reply: string }> {
-  const res = await fetch("/api/ai/chat", opts("POST", { workspace_id: workspaceId, messages }));
+// ----- AI assistant (works via file tools; server holds the key) -----
+export type AiUsage = { input: number; output: number; cached?: number; cost?: number };
+export type AiMessage = {
+  role: "user" | "assistant";
+  content: string;
+  reasoning?: string;
+  steps?: string[]; // live activity log (status lines + tool calls)
+  usage?: AiUsage;
+  ms?: number; // wall-clock the response took
+  model?: string;
+  note?: boolean; // local slash-command note; never sent to the model
+};
+export type AiDone = { usage?: AiUsage; source?: string; model?: string; ms?: number; profile?: string };
+export type AiStreamEvent =
+  | { kind: "text"; text: string }
+  | { kind: "reasoning"; text: string }
+  | { kind: "status"; text: string }
+  | { kind: "tool"; name: string; arg: string; result: string };
+
+// Streams the assistant's reply as Server-Sent Events. `on` fires for each event:
+// "text" (answer), "reasoning" (extended thinking), "status" (model/retries), and
+// "tool" (each file tool call, live). Resolves with token usage, model, timing.
+export async function aiChat(
+  workspaceId: number,
+  messages: AiMessage[],
+  on: (e: AiStreamEvent) => void,
+  attachments: string[] = [],
+  profile?: string,
+): Promise<AiDone> {
+  const res = await fetch(
+    "/api/ai/chat",
+    opts("POST", { workspace_id: workspaceId, messages, attachments, profile }),
+  );
   if (res.status === 503) throw new Error("AI isn't set up on this server yet.");
-  return json(res);
+  if (!res.ok || !res.body) throw new Error("AI request failed");
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  let done: AiDone = {};
+  for (;;) {
+    const { done: fin, value } = await reader.read();
+    if (fin) break;
+    buf += decoder.decode(value, { stream: true });
+    let i: number;
+    while ((i = buf.indexOf("\n\n")) >= 0) {
+      const frame = buf.slice(0, i);
+      buf = buf.slice(i + 2);
+      const dataLine = frame.split("\n").find((l) => l.startsWith("data:"));
+      if (!dataLine) continue;
+      const payload = dataLine.slice(5).trim();
+      if (!payload) continue;
+      let ev: {
+        t?: string;
+        text?: string;
+        message?: string;
+        name?: string;
+        arg?: string;
+        result?: string;
+        input?: number;
+        output?: number;
+        cached?: number;
+        cost?: number;
+        source?: string;
+        model?: string;
+        profile?: string;
+        ms?: number;
+      };
+      try {
+        ev = JSON.parse(payload);
+      } catch {
+        continue;
+      }
+      if (ev.t === "delta") on({ kind: "text", text: ev.text ?? "" });
+      else if (ev.t === "reasoning") on({ kind: "reasoning", text: ev.text ?? "" });
+      else if (ev.t === "status") on({ kind: "status", text: ev.text ?? "" });
+      else if (ev.t === "tool") on({ kind: "tool", name: ev.name ?? "", arg: ev.arg ?? "", result: ev.result ?? "" });
+      else if (ev.t === "done")
+        done = {
+          usage: { input: ev.input ?? 0, output: ev.output ?? 0, cached: ev.cached ?? 0, cost: ev.cost ?? 0 },
+          source: ev.source,
+          model: ev.model,
+          profile: ev.profile,
+          ms: ev.ms,
+        };
+      else if (ev.t === "error") throw new Error(ev.message || "AI error");
+    }
+  }
+  return done;
 }
 
-// ----- AI provider settings (keys are write-only; never returned) -----
+// ----- AI provider settings (up to 3 named profiles; keys write-only) -----
 export type AiProviderKind = "anthropic" | "openai" | "azure";
-export type AiProviderView = { provider: AiProviderKind; base_url: string | null; model: string; has_key: boolean };
+export type AiProviderView = {
+  name: string;
+  provider: AiProviderKind;
+  base_url: string | null;
+  model: string;
+  has_key: boolean;
+  is_current: boolean;
+};
 export type AiSettings = {
   storage_ready: boolean; // AI_KEY_SECRET is set (keys can be stored)
   env_fallback: boolean; // server ANTHROPIC_API_KEY is set
   is_admin: boolean;
-  mine: AiProviderView | null;
-  effective: { source: "user" | "org" | "env"; provider: string; model: string } | null;
-  org?: AiProviderView | null;
+  max_profiles: number;
+  profiles: AiProviderView[];
+  current: string | null;
+  effective: { source: "user" | "org" | "env"; provider: string; model: string; name: string } | null;
+  org_profiles?: AiProviderView[];
   org_users?: { user_id: number; provider: string; model: string }[];
 };
 export async function getAiSettings(): Promise<AiSettings> {
@@ -243,6 +335,7 @@ export async function getAiSettings(): Promise<AiSettings> {
 }
 export async function saveAiProvider(body: {
   scope: "user" | "org";
+  name: string;
   provider: AiProviderKind;
   base_url?: string;
   model: string;
@@ -250,20 +343,36 @@ export async function saveAiProvider(body: {
 }): Promise<void> {
   await json(await fetch("/api/ai/providers", opts("POST", body)));
 }
-export async function deleteAiProvider(scope: "user" | "org"): Promise<void> {
-  await json(await fetch(`/api/ai/providers?scope=${scope}`, opts("DELETE")));
+export async function deleteAiProvider(scope: "user" | "org", name: string): Promise<void> {
+  await json(await fetch(`/api/ai/providers?scope=${scope}&name=${encodeURIComponent(name)}`, opts("DELETE")));
+}
+export async function setCurrentProvider(scope: "user" | "org", name: string): Promise<void> {
+  await json(await fetch("/api/ai/providers/current", opts("POST", { scope, name })));
 }
 // Fire a real completion at this config from the backend to verify it works.
 // Throws with the provider's error message on failure. `key` may be omitted to
 // test the already-saved key. The browser never calls the AI provider directly.
 export async function testAiProvider(body: {
   scope: "user" | "org";
+  name?: string;
   provider: AiProviderKind;
   base_url?: string;
   model: string;
   key?: string;
 }): Promise<{ ok: boolean; reply: string }> {
   return json(await fetch("/api/ai/test", opts("POST", body)));
+}
+
+// ----- AI usage / cost dashboard (owner sees all; admin sees their org) -----
+export type UsageStat = { label: string; requests: number; input_tokens: number; output_tokens: number };
+export type AiUsageReport = {
+  scope: "all" | "org";
+  totals: { requests: number; input_tokens: number; output_tokens: number };
+  by_model: UsageStat[];
+  by_user: UsageStat[];
+};
+export async function getAiUsage(): Promise<AiUsageReport> {
+  return json(await fetch("/api/ai/usage", { credentials: "include" }));
 }
 
 // ----- storage stats (owner / admin) -----
