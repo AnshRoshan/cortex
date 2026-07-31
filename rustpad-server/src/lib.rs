@@ -112,7 +112,7 @@ pub fn server(config: ServerConfig) -> BoxedFilter<(impl Reply,)> {
         frame-ancestors 'none'; form-action 'self'; img-src 'self' data: blob:; \
         font-src 'self' data:; style-src 'self' 'unsafe-inline'; \
         script-src 'self' 'wasm-unsafe-eval'; worker-src 'self' blob:; \
-        connect-src 'self'; frame-src 'self'";
+        connect-src 'self' wss: ws:; frame-src 'self'";
     let csp_header = if std::env::var("CSP_REPORT_ONLY").is_ok() {
         "content-security-policy-report-only"
     } else {
