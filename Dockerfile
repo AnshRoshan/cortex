@@ -43,14 +43,22 @@ RUN npm run check
 RUN npm run build
 
 # Alpine (not scratch) so we get a writable data dir, CA certs, and a real user.
+# Caddy is baked in so ONE container serves app + auto-HTTPS (see docker-entrypoint.sh).
 FROM alpine AS runtime
-RUN apk --no-cache add ca-certificates \
+RUN apk --no-cache add ca-certificates caddy libcap \
     && adduser -D -u 1000 app \
-    && mkdir -p /data && chown app /data
+    && mkdir -p /data && chown app /data \
+    && setcap cap_net_bind_service=+ep "$(command -v caddy)"  # let non-root bind 80/443
 WORKDIR /app
 COPY --from=frontend /usr/src/app/dist dist
 COPY --from=backend /rustpad-server .
+COPY Caddyfile /etc/caddy/Caddyfile
+COPY docker-entrypoint.sh /usr/local/bin/entrypoint
+RUN chmod +x /usr/local/bin/entrypoint
 USER app
-ENV SQLITE_URI=sqlite:///data/authpad.db
-EXPOSE 3030
-CMD [ "./rustpad-server" ]
+# XDG_* point Caddy's cert store at the /data volume so certs persist across restarts.
+ENV SQLITE_URI=sqlite:///data/authpad.db \
+    XDG_DATA_HOME=/data \
+    XDG_CONFIG_HOME=/data
+EXPOSE 80 443 3030
+ENTRYPOINT [ "entrypoint" ]
